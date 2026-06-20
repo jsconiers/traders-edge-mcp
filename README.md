@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (12)
+## Tools (31)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -43,6 +43,46 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 | `next_event` | The single next macro event with an ET countdown. |
 
 Plus `traders_edge_status` (health check / current spot).
+
+### Tier 2 — Macro context (FRED, key-less)
+| Tool | What it does |
+|------|--------------|
+| `fed_funds` | Current Fed Funds rate + recent monthly path. |
+| `yield_curve` | Treasury curve (3M–30Y), 2s10s / 3m10s spreads, inversion flags. |
+| `inflation` | CPI / core CPI / PCE / core PCE (YoY) + 5Y/10Y breakevens. |
+| `labor_market` | Unemployment, payroll change, participation, wages, claims. |
+| `growth` | Real GDP, industrial production, retail sales. |
+| `financial_conditions` | NFCI, HY & IG credit spreads, dollar index, VIX. |
+| `recession_indicators` | Sahm Rule, curve spreads, composite read. |
+| `series` / `latest` | Any FRED series ID over a window, or latest values for a list. |
+| `series_search` | Catalog keyword search (needs free `FRED_API_KEY`). |
+| `fred_status` | FRED health check. |
+
+Macro data is pulled key-less from the FRED fredgraph CSV endpoint.
+
+### Cross-broker risk / Greeks aggregator
+| Tool | What it does |
+|------|--------------|
+| `net_greeks` | Net dollar delta / gamma / theta / vega across Alpaca + your positions file; delta also in SPX points. |
+| `risk_summary` | Beta-weighted SPX exposure, gross/long/short notional, by-broker & by-underlying breakdowns, top contributors. |
+| `concentration` | Exposure % by underlying; flags names above the threshold (default 25%, `CONCENTRATION_PCT`). |
+| `scenario_shock` | Portfolio P&L across a set of SPX % moves (delta + gamma convexity). |
+| `daily_target` | Today's realized P&L vs your daily target (`DAILY_TARGET`, default $524), with a post-target discipline check. |
+| `alpaca_positions` / `load_positions` | Raw position views from each source. |
+| `risk_status` | Which position sources are configured / reachable. |
+
+Positions come from your **Alpaca** account (live; creds via `ALPACA_ENV_FILE`, default the alpaca-mcp
+`.env`) plus a broker-agnostic **positions file** (default `~/.trading/positions.json`, override
+`POSITIONS_FILE`) for holdings held elsewhere (Robinhood, E\*TRADE, etc.). SPX/SPXW options are
+auto-priced from CBOE; equities are beta-weighted; other instruments use the optional fields you
+supply. Example positions file:
+
+```json
+{"positions": [
+  {"broker": "robinhood", "symbol": "ICE", "qty": 500, "type": "equity", "beta": 1.05},
+  {"broker": "robinhood", "symbol": "SPXW260620P07400000", "qty": -2, "type": "option"}
+]}
+```
 
 ## Data sources (no API key required)
 

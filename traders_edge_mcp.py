@@ -23,6 +23,8 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import csv
+import io
 import sys
 import time
 from typing import Annotated, Any, Optional
@@ -932,6 +934,792 @@ async def next_event(importance: str = "high") -> dict:
     return {"event": e["name"], "date": e["date"], "timeET": e.get("time"),
             "importance": e["importance"], "source": e["source"],
             "countdownHours": round(hrs, 1), "countdown": f"{int(hrs // 24)}d {int(hrs % 24)}h"}
+
+
+# ======================================================================
+# Tier 2: FRED macroeconomic data (key-less fredgraph backend)
+# ======================================================================
+
+FREDGRAPH = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+FRED_UA = "Mozilla/5.0"  # FRED's CDN tarpits long browser UAs; a simple one passes
+FRED_API = "https://api.stlouisfed.org/fred"
+FRED_CACHE_TTL = 1800.0          # 30 min; macro series update slowly
+FRED_TIMEOUT = 30.0
+
+# Friendly catalog of the series the higher-level tools use.
+SERIES = {
+    "FEDFUNDS": "Effective Federal Funds Rate (monthly, %)",
+    "DFF": "Effective Federal Funds Rate (daily, %)",
+    "DGS3MO": "3-Month Treasury (%)", "DGS2": "2-Year Treasury (%)",
+    "DGS5": "5-Year Treasury (%)", "DGS10": "10-Year Treasury (%)",
+    "DGS30": "30-Year Treasury (%)", "T10Y2Y": "10Y-2Y Treasury spread (%)",
+    "T10Y3M": "10Y-3M Treasury spread (%)",
+    "CPIAUCSL": "CPI, all items (index)", "CPILFESL": "Core CPI, ex food & energy (index)",
+    "PCEPI": "PCE price index", "PCEPILFE": "Core PCE price index",
+    "T5YIE": "5-Year breakeven inflation (%)", "T10YIE": "10-Year breakeven inflation (%)",
+    "UNRATE": "Unemployment rate (%)", "PAYEMS": "Nonfarm payrolls (thousands)",
+    "CIVPART": "Labor force participation rate (%)", "ICSA": "Initial jobless claims",
+    "CES0500000003": "Avg hourly earnings (index)",
+    "GDPC1": "Real GDP (chained $bn, SAAR)", "INDPRO": "Industrial production (index)",
+    "RSAFS": "Retail sales (advance, $mm)",
+    "NFCI": "Chicago Fed National Financial Conditions Index",
+    "BAMLH0A0HYM2": "ICE BofA US High-Yield OAS (%)",
+    "BAMLC0A0CM": "ICE BofA US Corporate (IG) OAS (%)",
+    "DTWEXBGS": "Trade-weighted US Dollar Index (broad)",
+    "VIXCLS": "CBOE VIX (close)", "DCOILWTICO": "WTI crude oil ($/bbl)",
+    "SAHMREALTIME": "Sahm Rule recession indicator (real-time, %)",
+    "M2SL": "M2 money supply ($bn)", "WALCL": "Fed total assets ($mm)",
+    "MORTGAGE30US": "30-Year fixed mortgage rate (%)",
+    "UMCSENT": "U. Michigan consumer sentiment",
+}
+
+
+_fred_client: Optional[httpx.Client] = None
+_fred_cache: dict = {}
+
+
+def _fred_get_client() -> httpx.Client:
+    global _fred_client
+    if _fred_client is None:
+        _fred_client = httpx.Client(timeout=FRED_TIMEOUT, follow_redirects=True,
+                               headers={"User-Agent": FRED_UA})
+    return _fred_client
+
+
+class FredError(Exception):
+    pass
+
+
+def _fetch_series(series_id: str, start: Optional[str] = None,
+                  end: Optional[str] = None) -> list[tuple[str, float]]:
+    """Return [(date, value)] for a FRED series via the key-less fredgraph CSV endpoint."""
+    sid = series_id.strip().upper()
+    params = {"id": sid}
+    if start:
+        params["cosd"] = start
+    if end:
+        params["coed"] = end
+    key = f"{sid}|{start}|{end}"
+    hit = _fred_cache.get(key)
+    if hit and (time.monotonic() - hit[1]) < FRED_CACHE_TTL:
+        return hit[0]
+    last = None
+    for _ in range(3):
+        try:
+            r = _fred_get_client().get(FREDGRAPH, params=params)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(1.0)
+    else:
+        raise FredError(f"Request failed for {sid}: {last}")
+    if r.status_code != 200:
+        raise FredError(f"FRED returned HTTP {r.status_code} for {sid}")
+    rows: list[tuple[str, float]] = []
+    reader = csv.reader(io.StringIO(r.text))
+    header = next(reader, None)
+    for row in reader:
+        if len(row) < 2:
+            continue
+        d, v = row[0].strip(), row[1].strip()
+        if v in ("", "."):
+            continue
+        try:
+            rows.append((d, float(v)))
+        except ValueError:
+            continue
+    if not rows:
+        raise FredError(f"No observations for series '{sid}' (check the series ID).")
+    _fred_cache[key] = (rows, time.monotonic())
+    return rows
+
+
+def _latest_obs(series_id: str) -> Optional[tuple[str, float]]:
+    # Bounded windows keep downloads small (full history of daily series is large/slow).
+    for win in (450, 1800):
+        try:
+            rows = _fetch_series(series_id, start=_recent_window(win))
+        except FredError:
+            return None
+        if rows:
+            return rows[-1]
+    return None
+
+
+def _recent_window(days: int) -> str:
+    return (_dt.date.today() - _dt.timedelta(days=days)).isoformat()
+
+
+def _yoy(series_id: str) -> Optional[dict]:
+    """Latest year-over-year % change for a (monthly) series."""
+    rows = _fetch_series(series_id, start=_recent_window(800))
+    if len(rows) < 13:
+        return None
+    last_date, last_val = rows[-1]
+    target = _dt.date.fromisoformat(last_date) - _dt.timedelta(days=365)
+    prior = min(rows, key=lambda r: abs((_dt.date.fromisoformat(r[0]) - target).days))
+    if prior[1] == 0:
+        return None
+    yoy = (last_val / prior[1] - 1.0) * 100.0
+    return {"date": last_date, "value": round(last_val, 3),
+            "yoy_pct": round(yoy, 2), "priorDate": prior[0]}
+
+
+def _change(series_id: str, periods: int) -> Optional[dict]:
+    """Latest level and absolute change over `periods` observations (e.g. MoM=1)."""
+    rows = _fetch_series(series_id, start=_recent_window(1500))
+    if len(rows) <= periods:
+        return None
+    last_date, last_val = rows[-1]
+    prior_date, prior_val = rows[-1 - periods]
+    return {"date": last_date, "value": round(last_val, 2),
+            "change": round(last_val - prior_val, 2), "priorDate": prior_date}
+
+
+
+
+@mcp.tool()
+def fred_status() -> dict:
+    """Health check: confirms the key-less FRED endpoint is reachable and reports the latest Fed Funds."""
+    obs = _latest_obs("DFF") or _latest_obs("FEDFUNDS")
+    if not obs:
+        return {"reachable": False, "error": "Could not reach FRED fredgraph endpoint."}
+    return {"reachable": True, "source": "FRED fredgraph (key-less)",
+            "effectiveFedFunds": {"date": obs[0], "value": obs[1]},
+            "catalogSeries": len(SERIES), "searchEnabled": bool(os.environ.get("FRED_API_KEY"))}
+
+
+@mcp.tool()
+def series(
+    series_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: Annotated[int, Field(ge=1, le=500)] = 24,
+) -> dict:
+    """Fetch observations for any FRED series ID (e.g. 'UNRATE', 'DGS10', 'CPIAUCSL').
+
+    `start`/`end` are YYYY-MM-DD; `limit` caps how many of the most-recent observations are returned.
+    Browse series IDs at https://fred.stlouisfed.org.
+    """
+    sid = series_id.strip().upper()
+    try:
+        rows = _fetch_series(sid, start=start, end=end)
+    except FredError as exc:
+        return {"error": str(exc)}
+    tail = rows[-limit:]
+    return {"series": sid, "title": SERIES.get(sid, "(see fred.stlouisfed.org)"),
+            "observations": [{"date": d, "value": v} for d, v in tail],
+            "count": len(tail), "totalAvailable": len(rows),
+            "latest": {"date": rows[-1][0], "value": rows[-1][1]}}
+
+
+@mcp.tool()
+def latest(series_ids: str) -> dict:
+    """Latest value for one or more FRED series IDs (comma-separated, e.g. 'DGS10,UNRATE,VIXCLS')."""
+    ids = [s.strip().upper() for s in series_ids.split(",") if s.strip()]
+    out = {}
+    for sid in ids:
+        obs = _latest_obs(sid)
+        out[sid] = ({"date": obs[0], "value": obs[1], "title": SERIES.get(sid, "")}
+                    if obs else {"error": "not found / unavailable"})
+    return {"latest": out}
+
+
+@mcp.tool()
+def fed_funds() -> dict:
+    """Current Fed Funds rate (effective, daily) plus the recent monthly path."""
+    dff = _latest_obs("DFF")
+    path = []
+    try:
+        rows = _fetch_series("FEDFUNDS", start=_recent_window(420))
+        path = [{"date": d, "value": v} for d, v in rows[-12:]]
+    except FredError:
+        pass
+    out = {"effectiveRate": ({"date": dff[0], "value": dff[1]} if dff else None),
+           "recentMonthlyPath": path}
+    if len(path) >= 2:
+        out["last12moChange"] = round(path[-1]["value"] - path[0]["value"], 2)
+    return out
+
+
+@mcp.tool()
+def yield_curve() -> dict:
+    """Current US Treasury yield curve (3M, 2Y, 5Y, 10Y, 30Y), key spreads, and inversion flags."""
+    pts = [("DGS3MO", "3M"), ("DGS2", "2Y"), ("DGS5", "5Y"), ("DGS10", "10Y"), ("DGS30", "30Y")]
+    curve = []
+    vals = {}
+    for sid, label in pts:
+        obs = _latest_obs(sid)
+        if obs:
+            vals[label] = obs[1]
+            curve.append({"tenor": label, "yield": obs[1], "date": obs[0]})
+    s_10_2 = _latest_obs("T10Y2Y")
+    s_10_3m = _latest_obs("T10Y3M")
+    out = {"curve": curve,
+           "spreads": {
+               "10Y_2Y": (s_10_2[1] if s_10_2 else None),
+               "10Y_3M": (s_10_3m[1] if s_10_3m else None)},
+           "inverted_2s10s": (s_10_2[1] < 0 if s_10_2 else None),
+           "inverted_3m10s": (s_10_3m[1] < 0 if s_10_3m else None)}
+    if s_10_2:
+        out["shape"] = ("inverted (recession signal)" if s_10_2[1] < 0
+                        else "flat" if s_10_2[1] < 0.25 else "normal upward")
+    return out
+
+
+@mcp.tool()
+def inflation() -> dict:
+    """Headline & core CPI and PCE (latest level + YoY) plus 5Y/10Y market-implied breakevens."""
+    out = {"cpi": _yoy("CPIAUCSL"), "coreCpi": _yoy("CPILFESL"),
+           "pce": _yoy("PCEPI"), "corePce": _yoy("PCEPILFE")}
+    be5 = _latest_obs("T5YIE")
+    be10 = _latest_obs("T10YIE")
+    out["breakevens"] = {
+        "5Y": ({"date": be5[0], "value": be5[1]} if be5 else None),
+        "10Y": ({"date": be10[0], "value": be10[1]} if be10 else None)}
+    return out
+
+
+@mcp.tool()
+def labor_market() -> dict:
+    """Unemployment rate, nonfarm payroll change (MoM), participation, wages (YoY), and initial claims."""
+    unrate = _latest_obs("UNRATE")
+    return {
+        "unemploymentRate": ({"date": unrate[0], "value": unrate[1]} if unrate else None),
+        "nonfarmPayrolls_MoM_thousands": _change("PAYEMS", 1),
+        "participationRate": (lambda o: {"date": o[0], "value": o[1]} if o else None)(_latest_obs("CIVPART")),
+        "avgHourlyEarnings_YoY": _yoy("CES0500000003"),
+        "initialClaims": (lambda o: {"date": o[0], "value": int(o[1])} if o else None)(_latest_obs("ICSA")),
+    }
+
+
+@mcp.tool()
+def growth() -> dict:
+    """Real GDP (latest + QoQ change), industrial production (YoY), and retail sales (YoY)."""
+    return {
+        "realGDP_chained_bn": _change("GDPC1", 1),
+        "industrialProduction_YoY": _yoy("INDPRO"),
+        "retailSales_YoY": _yoy("RSAFS"),
+    }
+
+
+@mcp.tool()
+def financial_conditions() -> dict:
+    """Financial-conditions snapshot: Chicago Fed NFCI, HY & IG credit spreads, dollar index, and VIX."""
+    def g(sid):
+        o = _latest_obs(sid)
+        return {"date": o[0], "value": o[1]} if o else None
+    nfci = _latest_obs("NFCI")
+    out = {
+        "nfci": g("NFCI"),
+        "nfciRead": (None if not nfci else
+                     ("tighter than average" if nfci[1] > 0 else "looser than average")),
+        "highYieldOAS_pct": g("BAMLH0A0HYM2"),
+        "investmentGradeOAS_pct": g("BAMLC0A0CM"),
+        "dollarIndexBroad": g("DTWEXBGS"),
+        "vix": g("VIXCLS"),
+    }
+    return out
+
+
+@mcp.tool()
+def recession_indicators() -> dict:
+    """Recession watch: Sahm Rule, 2s10s and 3m10s curve spreads, with a simple composite read."""
+    sahm = _latest_obs("SAHMREALTIME")
+    s2s10 = _latest_obs("T10Y2Y")
+    s3m10 = _latest_obs("T10Y3M")
+    flags = []
+    if sahm and sahm[1] >= 0.50:
+        flags.append("Sahm Rule triggered (>=0.50)")
+    if s2s10 and s2s10[1] < 0:
+        flags.append("2s10s inverted")
+    if s3m10 and s3m10[1] < 0:
+        flags.append("3m10s inverted")
+    return {
+        "sahmRule": ({"date": sahm[0], "value": sahm[1],
+                      "triggered": sahm[1] >= 0.50} if sahm else None),
+        "spread_2s10s": (s2s10[1] if s2s10 else None),
+        "spread_3m10s": (s3m10[1] if s3m10 else None),
+        "activeFlags": flags,
+        "read": ("elevated signals" if len(flags) >= 2 else
+                 "some signal" if flags else "no classic recession flags active"),
+    }
+
+
+@mcp.tool()
+def series_search(query: str, limit: Annotated[int, Field(ge=1, le=50)] = 12) -> dict:
+    """Search the FRED catalog by keyword for series IDs. Requires FRED_API_KEY (free) to be set."""
+    key = os.environ.get("FRED_API_KEY")
+    if not key:
+        return {"error": "Set FRED_API_KEY (free at https://fred.stlouisfed.org/docs/api/api_key.html) "
+                         "to enable catalog search. Observation tools work without a key."}
+    try:
+        r = _fred_get_client().get(f"{FRED_API}/series/search", params={
+            "search_text": query, "api_key": key, "file_type": "json",
+            "limit": limit, "order_by": "popularity", "sort_order": "desc"})
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"FRED search failed: {str(exc)[:160]}"}
+    out = [{"id": s.get("id"), "title": s.get("title"),
+            "frequency": s.get("frequency_short"), "units": s.get("units_short"),
+            "lastUpdated": s.get("last_updated")} for s in data.get("seriess", [])]
+    return {"query": query, "count": len(out), "results": out}
+
+# ======================================================================
+# Cross-broker risk / Greeks aggregator (Alpaca-live + positions file)
+# ======================================================================
+
+ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
+ALPACA_LIVE_URL = "https://api.alpaca.markets"
+ALPACA_ENV_DEFAULT = "/Users/jsconiers/Claude/mcp/alpaca/.env"
+POSITIONS_FILE_DEFAULT = os.path.expanduser("~/.trading/positions.json")
+CONC_THRESHOLD = float(os.environ.get("CONCENTRATION_PCT", "25"))   # flag underlyings above this % of gross
+DAILY_TARGET_DEFAULT = float(os.environ.get("DAILY_TARGET", "524"))  # default daily profit target ($)
+
+
+def _alpaca_creds() -> tuple:
+    key = os.environ.get("ALPACA_API_KEY")
+    sec = os.environ.get("ALPACA_SECRET_KEY")
+    paper = os.environ.get("ALPACA_PAPER_TRADE", "true")
+    envf = os.environ.get("ALPACA_ENV_FILE", ALPACA_ENV_DEFAULT)
+    if not (key and sec) and os.path.exists(envf):
+        for line in open(envf):
+            line = line.strip()
+            if line.startswith("ALPACA_API_KEY="):
+                key = line.split("=", 1)[1].strip()
+            elif line.startswith("ALPACA_SECRET_KEY="):
+                sec = line.split("=", 1)[1].strip()
+            elif line.startswith("ALPACA_PAPER_TRADE="):
+                paper = line.split("=", 1)[1].strip()
+    return key, sec, str(paper).lower() != "false"
+
+
+async def _alpaca_get(path: str) -> Any:
+    key, sec, paper = _alpaca_creds()
+    if not (key and sec):
+        raise EdgeError("Alpaca credentials not found (set ALPACA_API_KEY/ALPACA_SECRET_KEY or ALPACA_ENV_FILE).")
+    base = ALPACA_PAPER_URL if paper else ALPACA_LIVE_URL
+    r = await _get_client().get(base + path,
+                                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec})
+    if r.status_code in (401, 403):
+        raise EdgeError(f"Alpaca auth failed ({r.status_code}); check keys and paper-vs-live.")
+    r.raise_for_status()
+    return r.json()
+
+
+async def _yahoo_price(symbol: str) -> Optional[float]:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        r = await _get_client().get(url, params={"interval": "1d", "range": "1d"})
+        meta = r.json()["chart"]["result"][0]["meta"]
+        px = meta.get("regularMarketPrice") or meta.get("previousClose")
+        return float(px) if px is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _greeks_risk(S: float, K: float, T: float, sigma: float, is_call: bool, r: float = RISK_FREE):
+    """Scalar (delta, gamma, theta_per_day, vega_per_1pct_vol) for one option."""
+    sqrtT = np.sqrt(T)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    pdf = _norm_pdf(d1)
+    gamma = pdf / (S * sigma * sqrtT)
+    delta = _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
+    vega = S * pdf * sqrtT / 100.0
+    if is_call:
+        theta = (-(S * pdf * sigma) / (2 * sqrtT) - r * K * np.exp(-r * T) * _norm_cdf(d2)) / 365.0
+    else:
+        theta = (-(S * pdf * sigma) / (2 * sqrtT) + r * K * np.exp(-r * T) * _norm_cdf(-d2)) / 365.0
+    return float(delta), float(gamma), float(theta), float(vega)
+
+
+def _sign_qty(qty, side: Optional[str]) -> float:
+    q = float(qty)
+    if side and side.lower() == "short" and q > 0:
+        q = -q
+    return q
+
+
+def _normalize_alpaca(rows: list) -> list:
+    out = []
+    for p in rows or []:
+        sym = p.get("symbol", "")
+        ac = p.get("asset_class", "us_equity")
+        qty = _sign_qty(p.get("qty", 0), p.get("side"))
+        mv = float(p.get("market_value") or 0.0)
+        if ac == "us_option":
+            parsed = _parse_occ(sym)
+            und = parsed[0] if parsed else sym
+            out.append({"broker": "alpaca", "symbol": sym, "qty": qty, "type": "option",
+                        "underlying": und, "mv": mv,
+                        "unrealizedPL": float(p.get("unrealized_pl") or 0.0)})
+        else:
+            out.append({"broker": "alpaca", "symbol": sym, "qty": qty, "type": "equity",
+                        "underlying": sym, "price": float(p.get("current_price") or 0.0),
+                        "mv": mv, "unrealizedPL": float(p.get("unrealized_pl") or 0.0)})
+    return out
+
+
+def _read_positions_file() -> tuple:
+    path = os.environ.get("POSITIONS_FILE", POSITIONS_FILE_DEFAULT)
+    if not os.path.exists(path):
+        return [], path
+    import json as _json
+    try:
+        data = _json.load(open(path))
+    except Exception as exc:  # noqa: BLE001
+        raise EdgeError(f"Could not parse positions file {path}: {str(exc)[:120]}")
+    raw = data.get("positions", data) if isinstance(data, dict) else data
+    out = []
+    for p in raw or []:
+        out.append({"broker": p.get("broker", "file"), "symbol": p.get("symbol", ""),
+                    "qty": float(p.get("qty", 0)), "type": p.get("type", "equity"),
+                    "underlying": p.get("underlying") or p.get("symbol", ""),
+                    "iv": p.get("iv"), "price": p.get("price"), "beta": p.get("beta"),
+                    "strike": p.get("strike"), "expiry": p.get("expiry"), "cp": p.get("cp"),
+                    "delta": p.get("delta"), "mv": p.get("mv") or p.get("cost_basis")})
+    return out, path
+
+
+def _position_risk(p: dict, chain_by_sym: dict, spot: float, prices: dict) -> dict:
+    typ = p["type"]
+    qty = p["qty"]
+    if typ == "equity":
+        px = p.get("price") or prices.get(p["underlying"]) or 0.0
+        beta = float(p.get("beta") or 1.0)
+        dd = qty * px
+        return {"broker": p["broker"], "symbol": p["symbol"], "underlying": p["underlying"],
+                "type": "equity", "qty": qty, "price": round(px, 2), "beta": beta,
+                "delta$": dd, "gamma$_1pct": 0.0, "theta$_day": 0.0, "vega$_1pct": 0.0,
+                "betaDelta$": dd * beta,
+                "mv": (p.get("mv") if p.get("mv") is not None else dd), "greeksSource": "equity"}
+    parsed = _parse_occ(p["symbol"])
+    if parsed:
+        root, expiry, cp, strike = parsed
+    else:
+        root, expiry, cp, strike = (p.get("underlying") or ""), p.get("expiry"), p.get("cp"), p.get("strike")
+    cpC = (cp == "C")
+    mult = 100
+    if root in ("SPX", "SPXW") and expiry and strike:
+        o = chain_by_sym.get(p["symbol"])
+        iv = float(o["iv"]) if (o and o.get("iv")) else 0.0
+        T = _year_frac(expiry)
+        if iv > 0 and T > 0:
+            d, g, th, vg = _greeks_risk(spot, float(strike), T, iv, cpC)
+            dd = d * qty * mult * spot
+            return {"broker": p["broker"], "symbol": p["symbol"], "underlying": root, "type": "option",
+                    "qty": qty, "strike": strike, "expiry": expiry, "delta$": dd,
+                    "gamma$_1pct": g * qty * mult * spot * spot * 0.01,
+                    "theta$_day": th * qty * mult, "vega$_1pct": vg * qty * mult,
+                    "betaDelta$": dd, "mv": p.get("mv"), "greeksSource": "CBOE"}
+    undpx = p.get("price") or prices.get(p.get("underlying") or root) or 0.0
+    iv = p.get("iv")
+    beta = float(p.get("beta") or 1.0)
+    if iv and undpx and strike and expiry and cp:
+        T = _year_frac(expiry)
+        d, g, th, vg = _greeks_risk(float(undpx), float(strike), T, float(iv), cpC)
+        dd = d * qty * mult * undpx
+        return {"broker": p["broker"], "symbol": p["symbol"], "underlying": (p.get("underlying") or root),
+                "type": "option", "qty": qty, "strike": strike, "expiry": expiry, "delta$": dd,
+                "gamma$_1pct": g * qty * mult * undpx * undpx * 0.01,
+                "theta$_day": th * qty * mult, "vega$_1pct": vg * qty * mult,
+                "betaDelta$": dd * beta, "mv": p.get("mv"), "greeksSource": "computed(file iv)"}
+    if p.get("delta") is not None:
+        d = float(p["delta"])
+        dd = d * qty * mult * (undpx or 0.0)
+        return {"broker": p["broker"], "symbol": p["symbol"], "underlying": (p.get("underlying") or root),
+                "type": "option", "qty": qty, "delta$": dd, "gamma$_1pct": 0.0,
+                "theta$_day": 0.0, "vega$_1pct": 0.0, "betaDelta$": dd * beta,
+                "mv": p.get("mv"), "greeksSource": "file delta"}
+    return {"broker": p["broker"], "symbol": p["symbol"], "underlying": (p.get("underlying") or root),
+            "type": "option", "qty": qty, "delta$": 0.0, "gamma$_1pct": 0.0, "theta$_day": 0.0,
+            "vega$_1pct": 0.0, "betaDelta$": 0.0, "mv": p.get("mv"), "greeksSource": "unavailable"}
+
+
+async def _collect_positions(include_alpaca: bool, include_file: bool) -> tuple:
+    positions, meta = [], {}
+    if include_alpaca:
+        try:
+            rows = await _alpaca_get("/v2/positions")
+            positions += _normalize_alpaca(rows)
+            meta["alpaca"] = len(rows)
+        except EdgeError as exc:
+            meta["alpacaError"] = str(exc)
+    if include_file:
+        try:
+            fpos, path = _read_positions_file()
+            positions += fpos
+            meta["file"], meta["filePath"] = len(fpos), path
+        except EdgeError as exc:
+            meta["fileError"] = str(exc)
+    return positions, meta
+
+
+async def _price_map(positions: list, spot: float) -> dict:
+    need = set()
+    for p in positions:
+        if p["type"] == "equity" and not p.get("price"):
+            need.add(p["underlying"])
+        elif p["type"] == "option":
+            root = (_parse_occ(p["symbol"]) or [""])[0] or (p.get("underlying") or "")
+            if root not in ("SPX", "SPXW"):
+                need.add(p.get("underlying") or root)
+    need = [s for s in need if s]
+    if not need:
+        return {}
+    import asyncio
+    vals = await asyncio.gather(*[_yahoo_price(s) for s in need])
+    return {s: v for s, v in zip(need, vals)}
+
+
+async def _aggregate(include_alpaca: bool = True, include_file: bool = True) -> dict:
+    positions, meta = await _collect_positions(include_alpaca, include_file)
+    chain, spot = None, 0.0
+    has_spx = any(p["type"] == "option" and ((_parse_occ(p["symbol"]) or [""])[0] in ("SPX", "SPXW"))
+                  for p in positions)
+    if has_spx:
+        try:
+            chain = await _load_chain()
+            spot = chain["spot"]
+        except EdgeError:
+            pass
+    chain_by_sym = {o["symbol"]: o for o in (chain["options"] if chain else [])}
+    prices = await _price_map(positions, spot)
+    risks = [_position_risk(p, chain_by_sym, spot, prices) for p in positions]
+    return {"positions": risks, "spot": spot, "meta": meta}
+
+
+@mcp.tool()
+async def risk_status() -> dict:
+    """Health check for the cross-broker aggregator: which position sources are configured and reachable."""
+    key, sec, paper = _alpaca_creds()
+    out = {"alpaca": {"configured": bool(key and sec),
+                      "mode": "paper" if paper else "live"}}
+    if key and sec:
+        try:
+            acct = await _alpaca_get("/v2/account")
+            out["alpaca"]["reachable"] = True
+            out["alpaca"]["equity"] = float(acct.get("equity") or 0.0)
+        except EdgeError as exc:
+            out["alpaca"]["reachable"] = False
+            out["alpaca"]["error"] = str(exc)
+    _, fpath = _read_positions_file()
+    out["positionsFile"] = {"path": fpath, "exists": os.path.exists(fpath)}
+    return out
+
+
+@mcp.tool()
+async def alpaca_positions() -> dict:
+    """Live positions held in the Alpaca account (equities and options), normalized."""
+    try:
+        rows = await _alpaca_get("/v2/positions")
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    norm = _normalize_alpaca(rows)
+    return {"mode": "paper" if _alpaca_creds()[2] else "live", "count": len(norm), "positions": norm}
+
+
+@mcp.tool()
+async def load_positions() -> dict:
+    """Show the broker-agnostic positions file (for holdings not in Alpaca, e.g. Robinhood/E*TRADE).
+
+    Path defaults to ~/.trading/positions.json (override with POSITIONS_FILE). Each entry:
+    {broker, symbol, qty (negative=short), type: equity|option, and optional underlying/strike/expiry/
+    cp/iv/price/beta/delta/mv}. SPX/SPXW options are auto-priced from CBOE; others use the optional fields.
+    """
+    try:
+        pos, path = _read_positions_file()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    if not pos:
+        return {"path": path, "exists": os.path.exists(path), "count": 0,
+                "template": {"positions": [
+                    {"broker": "robinhood", "symbol": "ICE", "qty": 500, "type": "equity",
+                     "beta": 1.05, "mv": 75000},
+                    {"broker": "robinhood", "symbol": "SPXW260620P07400000", "qty": -2, "type": "option"}]}}
+    return {"path": path, "count": len(pos), "positions": pos}
+
+
+def _sum(risks: list, key: str) -> float:
+    return float(sum(r.get(key) or 0.0 for r in risks))
+
+
+def _exposure(r: dict) -> float:
+    mv = r.get("mv")
+    return abs(float(mv)) if mv is not None else abs(float(r.get("delta$") or 0.0))
+
+
+@mcp.tool()
+async def net_greeks(include_alpaca: bool = True, include_file: bool = True) -> dict:
+    """Net portfolio Greeks aggregated across Alpaca and the positions file.
+
+    Sums dollar delta, dollar gamma (per 1% move), theta (per day), and vega (per 1% vol). SPX/SPXW
+    options get full Black-Scholes Greeks off CBOE; equities contribute delta only (beta-weighted);
+    other instruments use whatever the positions file provides. Delta is also expressed in SPX points.
+    """
+    agg = await _aggregate(include_alpaca, include_file)
+    risks, spot = agg["positions"], agg["spot"]
+    if not risks:
+        return {"note": "No positions found.", "sources": agg["meta"]}
+    netd = _sum(risks, "delta$")
+    netbd = _sum(risks, "betaDelta$")
+    netg = _sum(risks, "gamma$_1pct")
+    nett = _sum(risks, "theta$_day")
+    netv = _sum(risks, "vega$_1pct")
+    cov = {}
+    for r in risks:
+        cov[r["greeksSource"]] = cov.get(r["greeksSource"], 0) + 1
+    out = {
+        "spot": round(spot, 2) if spot else None,
+        "positions": len(risks),
+        "netDelta$": round(netd, 0),
+        "netDelta_betaWeighted$": round(netbd, 0),
+        "netDelta_SPXpoints": (round(netbd / spot, 1) if spot else None),
+        "netGamma$_per_1pct": round(netg, 0),
+        "netTheta$_per_day": round(nett, 0),
+        "netVega$_per_1pct_vol": round(netv, 0),
+        "greeksCoverage": cov,
+        "sources": agg["meta"],
+    }
+    return out
+
+
+@mcp.tool()
+async def risk_summary(include_alpaca: bool = True, include_file: bool = True) -> dict:
+    """Portfolio risk overview: beta-weighted SPX exposure, gross/long/short notional, and breakdowns.
+
+    Groups exposure by broker and by underlying, and lists the largest directional contributors.
+    """
+    agg = await _aggregate(include_alpaca, include_file)
+    risks, spot = agg["positions"], agg["spot"]
+    if not risks:
+        return {"note": "No positions found.", "sources": agg["meta"]}
+    gross = sum(_exposure(r) for r in risks)
+    longn = sum(_exposure(r) for r in risks if (r.get("delta$") or 0) >= 0)
+    shortn = sum(_exposure(r) for r in risks if (r.get("delta$") or 0) < 0)
+    by_broker, by_under = {}, {}
+    for r in risks:
+        by_broker.setdefault(r["broker"], 0.0)
+        by_broker[r["broker"]] += r.get("betaDelta$") or 0.0
+        by_under.setdefault(r["underlying"], 0.0)
+        by_under[r["underlying"]] += r.get("betaDelta$") or 0.0
+    top = sorted(risks, key=lambda r: abs(r.get("delta$") or 0.0), reverse=True)[:6]
+    netbd = _sum(risks, "betaDelta$")
+    return {
+        "spot": round(spot, 2) if spot else None,
+        "netBetaDelta$": round(netbd, 0),
+        "netBetaDelta_SPXpoints": (round(netbd / spot, 1) if spot else None),
+        "grossNotional$": round(gross, 0),
+        "longNotional$": round(longn, 0), "shortNotional$": round(shortn, 0),
+        "byBroker_betaDelta$": {k: round(v, 0) for k, v in sorted(by_broker.items())},
+        "byUnderlying_betaDelta$": {k: round(v, 0) for k, v in
+                                    sorted(by_under.items(), key=lambda kv: -abs(kv[1]))},
+        "topContributors": [{"symbol": r["symbol"], "underlying": r["underlying"],
+                             "delta$": round(r.get("delta$") or 0.0, 0),
+                             "source": r["greeksSource"]} for r in top],
+        "sources": agg["meta"],
+    }
+
+
+@mcp.tool()
+async def concentration(include_alpaca: bool = True, include_file: bool = True) -> dict:
+    """Exposure concentration by underlying, flagging any name above the concentration threshold.
+
+    Threshold defaults to 25% of gross exposure (override with CONCENTRATION_PCT).
+    """
+    agg = await _aggregate(include_alpaca, include_file)
+    risks = agg["positions"]
+    if not risks:
+        return {"note": "No positions found.", "sources": agg["meta"]}
+    by_under = {}
+    for r in risks:
+        by_under[r["underlying"]] = by_under.get(r["underlying"], 0.0) + _exposure(r)
+    gross = sum(by_under.values()) or 1.0
+    rows = sorted(({"underlying": k, "exposure$": round(v, 0), "pctOfGross": round(100 * v / gross, 1)}
+                   for k, v in by_under.items()), key=lambda x: -x["pctOfGross"])
+    flagged = [r for r in rows if r["pctOfGross"] >= CONC_THRESHOLD]
+    return {"grossExposure$": round(gross, 0), "thresholdPct": CONC_THRESHOLD,
+            "byUnderlying": rows, "flagged": flagged,
+            "note": (f"{flagged[0]['underlying']} is {flagged[0]['pctOfGross']}% of gross exposure."
+                     if flagged else "No single name exceeds the concentration threshold."),
+            "sources": agg["meta"]}
+
+
+@mcp.tool()
+async def scenario_shock(
+    moves_pct: Optional[str] = None,
+    include_alpaca: bool = True, include_file: bool = True,
+) -> dict:
+    """Estimate portfolio P&L under a set of SPX % moves using net beta-delta + net gamma convexity.
+
+    `moves_pct` is a comma-separated list (e.g. '-2,-1,-0.5,0.5,1,2'); defaults to that set. SPX/SPXW
+    positions use delta + gamma; everything else is beta-weighted linear. A quick risk read, not a
+    full revaluation.
+    """
+    agg = await _aggregate(include_alpaca, include_file)
+    risks, spot = agg["positions"], agg["spot"]
+    if not risks:
+        return {"note": "No positions found.", "sources": agg["meta"]}
+    netbd = _sum(risks, "betaDelta$")
+    netg = _sum(risks, "gamma$_1pct")
+    if moves_pct:
+        try:
+            moves = [float(x) / 100.0 for x in moves_pct.split(",") if x.strip()]
+        except ValueError:
+            return {"error": "moves_pct must be comma-separated numbers, e.g. '-2,-1,1,2'."}
+    else:
+        moves = [-0.02, -0.01, -0.005, 0.005, 0.01, 0.02]
+    scen = []
+    for m in moves:
+        pnl = netbd * m + 50.0 * netg * m * m
+        scen.append({"spxMovePct": round(m * 100, 2),
+                     "spxLevel": (round(spot * (1 + m), 2) if spot else None),
+                     "estPnL$": round(pnl, 0)})
+    return {"spot": round(spot, 2) if spot else None,
+            "netBetaDelta$": round(netbd, 0), "netGamma$_per_1pct": round(netg, 0),
+            "scenarios": scen,
+            "method": "P&L = betaDelta$*move + 50*gamma$1pct*move^2 (gamma applies to SPX/SPXW legs)",
+            "sources": agg["meta"]}
+
+
+@mcp.tool()
+async def daily_target(
+    target: Optional[float] = None,
+    realized_pl: Optional[float] = None,
+) -> dict:
+    """Track today's realized P&L against your daily target, with a post-target discipline check.
+
+    `target` defaults to DAILY_TARGET ($524). `realized_pl` can be passed directly; otherwise it is
+    estimated from Alpaca as account equity minus prior-day equity. If you're already past target, this
+    flags it - your logged history shows post-target trades have generated most of your losses.
+    """
+    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    src = "provided"
+    rpl = realized_pl
+    if rpl is None:
+        try:
+            acct = await _alpaca_get("/v2/account")
+            eq = float(acct.get("equity") or 0.0)
+            last = float(acct.get("last_equity") or 0.0)
+            rpl = eq - last
+            src = "alpaca (equity - last_equity)"
+        except EdgeError as exc:
+            return {"error": f"No realized_pl provided and Alpaca unavailable: {exc}"}
+    pct = (rpl / tgt * 100.0) if tgt else None
+    over = rpl >= tgt
+    status = ("TARGET HIT" if over else "below target" if rpl >= 0 else "in drawdown")
+    out = {"target$": round(tgt, 2), "realizedPnL$": round(rpl, 2),
+           "pctOfTarget": (round(pct, 1) if pct is not None else None),
+           "source": src, "status": status}
+    if over:
+        out["guardrail"] = ("You're past your daily target. Your own logged pattern is that trades taken "
+                            "after hitting target produce most of your losses - strongly consider closing "
+                            "the platform for the day, or cutting size to 1/4 if you keep going.")
+    elif rpl < 0:
+        out["guardrail"] = "In drawdown - trade your plan; avoid revenge-sizing to get back to flat."
+    return out
 
 
 def main() -> None:
