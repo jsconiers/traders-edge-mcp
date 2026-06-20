@@ -2076,6 +2076,547 @@ async def daily_target(
     return out
 
 
+# ============================================================================
+# DISCIPLINE / ANTI-OVERTRADING LAYER (Robinhood option fills)
+# ============================================================================
+DD_GIVEBACK_FRAC = float(os.environ.get("TE_GIVEBACK_FRAC", "0.40"))  # of target, from peak -> STOP
+RAPID_REENTRY_SECS = float(os.environ.get("TE_RAPID_REENTRY_SECS", "90"))
+LATE_SESSION_ET = os.environ.get("TE_LATE_SESSION_ET", "15:45")  # final-stretch caution
+
+
+def _rh_recent_option_orders(stop_date: _dt.date, max_pages: int = 6) -> list:
+    """Filled+other option orders, newest-first, paginating only until we pass stop_date (ET)."""
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    try:
+        url = rh.urls.option_orders()
+    except Exception:  # noqa: BLE001
+        url = "https://api.robinhood.com/options/orders/"
+    out, page = [], 0
+    data = rh.helper.request_get(url, "regular")
+    while data and isinstance(data, dict):
+        results = data.get("results", []) or []
+        out.extend(results)
+        page += 1
+        oldest_d = None
+        if results:
+            try:
+                oldest_d = _dt.datetime.fromisoformat(
+                    results[-1].get("created_at", "").replace("Z", "+00:00")).astimezone(ET).date()
+            except Exception:  # noqa: BLE001
+                oldest_d = None
+        nxt = data.get("next")
+        if not nxt or page >= max_pages or (oldest_d and oldest_d < stop_date):
+            break
+        data = rh.helper.request_get(nxt, "regular")
+    return out
+
+
+def _order_to_fill(o: dict):
+    if o.get("state") != "filled":
+        return None
+    legs = o.get("legs", []) or []
+    net = _to_float(o.get("net_amount")) or 0.0
+    direction = o.get("net_amount_direction") or o.get("direction")
+    net_cf = net if direction == "credit" else -net
+    ts, trade_date = None, None
+    for lg in legs:
+        for ex in (lg.get("executions") or []):
+            t_ = ex.get("timestamp")
+            if t_ and (ts is None or t_ > ts):
+                ts = t_
+            trade_date = ex.get("trade_date") or trade_date
+    ts = ts or o.get("updated_at") or o.get("created_at")
+    try:
+        when = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ET)
+    except Exception:  # noqa: BLE001
+        return None
+    trade_date = trade_date or when.date().isoformat()
+    rec = {"time": when, "trade_date": trade_date, "chain": o.get("chain_symbol", ""),
+           "n_legs": len(legs), "net_cf": net_cf,
+           "gross_premium": _to_float(o.get("processed_premium")),
+           "qty": _to_float(o.get("processed_quantity")) or _to_float(o.get("quantity")) or 0.0}
+    if len(legs) == 1:
+        lg = legs[0]
+        ex0 = (lg.get("executions") or [{}])
+        rec.update({"option_id": (lg.get("option") or "").rstrip("/").split("/")[-1],
+                    "side": lg.get("side"), "effect": lg.get("position_effect"),
+                    "strike": _to_float(lg.get("strike_price")),
+                    "cp": {"call": "C", "put": "P"}.get(lg.get("option_type")),
+                    "expiry": lg.get("expiration_date"),
+                    "price": _to_float(ex0[0].get("price")) if ex0 else None})
+    else:
+        rec.update({"option_id": "multi:" + (o.get("id") or ""), "effect": None,
+                    "strike": None, "cp": None, "expiry": None})
+    return rec
+
+
+def _day_fills_sync(date_iso: str) -> list:
+    target = _dt.date.fromisoformat(date_iso)
+    fills = []
+    for o in _rh_recent_option_orders(target):
+        f = _order_to_fill(o)
+        if f and f["trade_date"] == date_iso:
+            fills.append(f)
+    fills.sort(key=lambda r: r["time"])
+    return fills
+
+
+async def _day_fills(date_iso: str) -> list:
+    import asyncio
+    return await asyncio.to_thread(_day_fills_sync, date_iso)
+
+
+def _fmt_et(d) -> str:
+    return d.astimezone(ET).strftime("%H:%M:%S")
+
+
+def _build_curve(trips: list, target: float) -> dict:
+    """Cumulative REALIZED-P&L curve stepped by completed round trips (sorted by close time)."""
+    trips = sorted(trips, key=lambda t: t["close"])
+    cum = peak = 0.0
+    max_dd = 0.0
+    cross_i = cross_cum = cross_time = None
+    rows = []
+    for i, t in enumerate(trips):
+        cum += t["pnl"]
+        peak = max(peak, cum)
+        max_dd = min(max_dd, cum - peak)
+        if cross_i is None and target > 0 and cum >= target:
+            cross_i, cross_cum, cross_time = i, cum, t["close"]
+        rows.append({"t": _fmt_et(t["close"]), "chain": t.get("chain"),
+                     "strike": t.get("strike"), "cp": t.get("cp"),
+                     "pnl$": round(t["pnl"], 2), "cum$": round(cum, 2)})
+    return {"rows": rows, "total": cum, "peak": peak, "maxDrawdownFromPeak": abs(max_dd),
+            "crossIdx": cross_i, "crossCum": cross_cum, "crossTime": cross_time}
+
+
+def _round_trips(fills: list) -> list:
+    from collections import defaultdict, deque
+    lots = defaultdict(deque)
+    trips = []
+    for f in fills:
+        oid, eff, qty, net = f.get("option_id"), f.get("effect"), (f.get("qty") or 0.0), f["net_cf"]
+        if eff == "open" and qty > 0:
+            lots[oid].append([qty, net, f["time"]])
+        elif eff == "close" and qty > 0:
+            remaining = qty
+            close_per = net / qty if qty else 0.0
+            while remaining > 1e-9 and lots[oid]:
+                lot = lots[oid][0]
+                lot_qty, lot_cost, lot_time = lot
+                take = min(remaining, lot_qty)
+                open_per = lot_cost / lot_qty if lot_qty else 0.0
+                trips.append({"open": lot_time, "close": f["time"], "chain": f.get("chain"),
+                              "strike": f.get("strike"), "cp": f.get("cp"), "qty": take,
+                              "pnl": take * (open_per + close_per),
+                              "holdSec": (f["time"] - lot_time).total_seconds()})
+                lot_qty -= take
+                lot[0], lot[1] = lot_qty, lot_cost - open_per * take
+                remaining -= take
+                if lot_qty <= 1e-9:
+                    lots[oid].popleft()
+    return trips
+
+
+@mcp.tool()
+async def daily_pnl_curve(date: Optional[str] = None, target: Optional[float] = None,
+                          full: bool = False) -> dict:
+    """Reconstruct today's realized P&L trade-by-trade from your Robinhood option fills.
+
+    Builds the running cumulative-P&L curve (net of fees), marks the moment you crossed your daily
+    target, and quantifies what happened AFTER that point - the single number your logged history says
+    costs you money. `date` (YYYY-MM-DD ET) defaults to today; `full=True` returns every fill row.
+    """
+    d = date or _today_et().isoformat()
+    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    try:
+        fills = await _day_fills(d)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    if not fills:
+        return {"date": d, "note": "No filled option orders for this date.", "realized$": 0.0,
+                "orders": 0}
+    trips = _round_trips(fills)
+    cash = round(sum(f["net_cf"] for f in fills), 2)
+    if not trips:
+        return {"date": d, "orders": len(fills), "netCashFlow$": cash,
+                "note": "No completed round trips - positions may still be open or expired by assignment."}
+    cur = _build_curve(trips, tgt)
+    by_chain = {}
+    for tr in trips:
+        by_chain[tr["chain"]] = round(by_chain.get(tr["chain"], 0.0) + tr["pnl"], 2)
+    after = (round(cur["total"] - cur["crossCum"], 2) if cur["crossCum"] is not None else None)
+    out = {"date": d, "target$": round(tgt, 2), "realized$": round(cur["total"], 2),
+           "orders": len(fills), "roundTrips": len(trips),
+           "peak$": round(cur["peak"], 2), "maxDrawdownFromPeak$": round(cur["maxDrawdownFromPeak"], 2),
+           "byUnderlying$": by_chain,
+           "firstFill": _fmt_et(fills[0]["time"]), "lastFill": _fmt_et(fills[-1]["time"])}
+    if abs(cash - cur["total"]) > 1.0:
+        out["netCashFlow$"] = cash
+        out["reconNote"] = "Net cash flow differs from round-trip realized; some positions expired or remain open."
+    if cur["crossIdx"] is not None:
+        out["targetCross"] = {"time": _fmt_et(cur["crossTime"]),
+                              "tradesAfter": len(trips) - 1 - cur["crossIdx"],
+                              "pnlSinceTarget$": after}
+        if after is not None and after < 0:
+            out["leak"] = (f"You hit ${tgt:.0f} at {_fmt_et(cur['crossTime'])}, then gave back "
+                           f"${abs(after):.2f} over {out['targetCross']['tradesAfter']} more trades. "
+                           f"This is the pattern - stopping at target would have left you ${cur['crossCum']:.2f}.")
+    out["curve"] = cur["rows"] if full else cur["rows"][-12:]
+    return out
+
+
+@mcp.tool()
+async def daily_review(date: Optional[str] = None, target: Optional[float] = None) -> dict:
+    """End-of-day scorecard from your Robinhood fills: win rate, expectancy, P&L by hour, and the
+    killer split - performance BEFORE vs AFTER you hit your daily target.
+
+    Pairs opening and closing fills (FIFO) into round trips to compute per-trade stats. `date`
+    (YYYY-MM-DD ET) defaults to today.
+    """
+    d = date or _today_et().isoformat()
+    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    try:
+        fills = await _day_fills(d)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    trips = _round_trips(fills)
+    if not trips:
+        return {"date": d, "note": "No completed round trips for this date.",
+                "orders": len(fills)}
+    cur = _build_curve(trips, tgt)
+    cross_time = cur["crossTime"]
+    wins = [t for t in trips if t["pnl"] > 0]
+    losses = [t for t in trips if t["pnl"] < 0]
+    gross_win = sum(t["pnl"] for t in wins)
+    gross_loss = -sum(t["pnl"] for t in losses)
+    total = sum(t["pnl"] for t in trips)
+    n = len(trips)
+
+    def _hhmm(secs):
+        return f"{int(secs // 60)}m{int(secs % 60):02d}s"
+
+    by_hour = {}
+    for t in trips:
+        hr = t["close"].astimezone(ET).strftime("%H:00")
+        h = by_hour.setdefault(hr, {"pnl": 0.0, "n": 0})
+        h["pnl"] += t["pnl"]; h["n"] += 1
+    by_hour = {k: {"pnl$": round(v["pnl"], 2), "trades": v["n"]} for k, v in sorted(by_hour.items())}
+
+    out = {"date": d, "target$": round(tgt, 2), "realized$": round(total, 2), "roundTrips": n,
+           "winRate%": round(100.0 * len(wins) / n, 1),
+           "avgWin$": round(gross_win / len(wins), 2) if wins else 0.0,
+           "avgLoss$": round(-gross_loss / len(losses), 2) if losses else 0.0,
+           "profitFactor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+           "expectancyPerTrade$": round(total / n, 2),
+           "largestWin$": round(max((t["pnl"] for t in trips), default=0.0), 2),
+           "largestLoss$": round(min((t["pnl"] for t in trips), default=0.0), 2),
+           "avgHoldTime": _hhmm(sum(t["holdSec"] for t in trips) / n),
+           "pnlByHour": by_hour}
+    if cross_time is not None:
+        before = [t for t in trips if t["close"] <= cross_time]
+        after = [t for t in trips if t["close"] > cross_time]
+        def _blk(ts):
+            if not ts:
+                return {"trades": 0, "pnl$": 0.0, "winRate%": None}
+            w = sum(1 for t in ts if t["pnl"] > 0)
+            return {"trades": len(ts), "pnl$": round(sum(t["pnl"] for t in ts), 2),
+                    "winRate%": round(100.0 * w / len(ts), 1)}
+        out["beforeVsAfterTarget"] = {"targetHitAt": _fmt_et(cross_time),
+                                      "beforeTarget": _blk(before), "afterTarget": _blk(after)}
+        a = out["beforeVsAfterTarget"]["afterTarget"]
+        if a["trades"] and a["pnl$"] < 0:
+            out["verdict"] = (f"After hitting target you took {a['trades']} more trades for "
+                              f"${a['pnl$']:.2f} ({a['winRate%']}% win). The discipline rule pays you "
+                              f"${abs(a['pnl$']):.2f}/session here.")
+    else:
+        out["note2"] = "Target not reached this session."
+    return out
+
+
+@mcp.tool()
+async def should_i_trade(date: Optional[str] = None, target: Optional[float] = None) -> dict:
+    """Real-time GO / CAUTION / STOP gate before your next 0DTE entry.
+
+    Combines past-target status, give-back from your intraday peak, consecutive losses, rapid re-entry
+    (churning), and time-of-session into one call. This is your agreed-on target procedure, made
+    queryable mid-session. Time-based signals assume `date` is today (the default).
+    """
+    d = date or _today_et().isoformat()
+    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    is_today = (d == _today_et().isoformat())
+    try:
+        fills = await _day_fills(d)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    now = _dt.datetime.now(ET)
+    trips = _round_trips(fills)
+    cur = _build_curve(trips, tgt)
+    total = cur["total"]
+    peak = cur["peak"]
+    reasons, flags = [], []
+
+    past_target = total >= tgt and tgt > 0
+    giveback = peak >= tgt and (peak - total) >= DD_GIVEBACK_FRAC * tgt
+    last3 = trips[-3:]
+    consec_losses = len(last3) >= 3 and all(t["pnl"] < 0 for t in last3)
+    consec2 = len(trips) >= 2 and all(t["pnl"] < 0 for t in trips[-2:])
+    deep_dd = total <= -0.5 * tgt
+    # rapid re-entry: tight gaps between last few opens
+    opens = [f["time"] for f in fills if f.get("effect") == "open"]
+    rapid = False
+    if len(opens) >= 3:
+        gaps = [(opens[i] - opens[i - 1]).total_seconds() for i in range(-2, 0)]
+        rapid = all(g < RAPID_REENTRY_SECS for g in gaps)
+    lh, lm = (int(x) for x in LATE_SESSION_ET.split(":"))
+    late = is_today and (now.hour, now.minute) >= (lh, lm) and now.hour < 16
+
+    if past_target:
+        flags.append("PAST_TARGET")
+        reasons.append(f"You're at ${total:.2f} vs ${tgt:.0f} target. Post-target trades are your "
+                       f"documented main source of losses.")
+    if giveback:
+        flags.append("GIVING_BACK")
+        reasons.append(f"You peaked at ${peak:.2f} and are now ${total:.2f} - given back "
+                       f"${peak - total:.2f} from the high.")
+    if consec_losses:
+        flags.append("CONSEC_LOSSES")
+        reasons.append("Last 3 round trips were all losers - classic tilt setup.")
+    if rapid:
+        flags.append("RAPID_REENTRY")
+        reasons.append(f"Last entries were <{int(RAPID_REENTRY_SECS)}s apart - you're churning, not "
+                       f"waiting for setups.")
+    if deep_dd:
+        flags.append("DEEP_DRAWDOWN")
+        reasons.append(f"Down ${abs(total):.2f} (>0.5x target) - high revenge-sizing risk.")
+    if late:
+        flags.append("LATE_SESSION")
+        reasons.append(f"It's {now.strftime('%H:%M')} ET - final-stretch 0DTE gamma/pin risk into the bell.")
+
+    if past_target or consec_losses or giveback:
+        verdict = "STOP"
+    elif late or rapid or deep_dd or consec2:
+        verdict = "CAUTION"
+    else:
+        verdict = "GO"
+    if not reasons:
+        reasons.append("No discipline flags: within target, no tilt signals, normal pacing.")
+    return {"date": d, "verdict": verdict, "flags": flags, "reasons": reasons,
+            "realized$": round(total, 2), "peak$": round(peak, 2), "target$": round(tgt, 2),
+            "roundTrips": len(trips), "asof": now.strftime("%H:%M:%S ET") if is_today else "EOD review"}
+
+
+# ============================================================================
+# 0DTE DECISION SUPPORT (chain-derived)
+# ============================================================================
+def _atm_iv(spot: float, opts: list):
+    from collections import defaultdict
+    by = defaultdict(dict)
+    for o in opts:
+        if o.get("iv", 0) > 0:
+            by[o["strike"]][o["cp"]] = o["iv"]
+    for k in sorted(by.keys(), key=lambda x: abs(x - spot)):
+        cp = by[k]
+        if "C" in cp and "P" in cp:
+            return k, (cp["C"] + cp["P"]) / 2.0
+        if "C" in cp or "P" in cp:
+            return k, list(cp.values())[0]
+    return None, None
+
+
+def _em_levels(spot: float, opts: list, expiry: Optional[str]) -> dict:
+    em = _expected_move(spot, opts)
+    atm_k, atm_iv = _atm_iv(spot, opts)
+    iv_em = None
+    if atm_iv and expiry:
+        T = _year_frac(expiry)
+        iv_em = spot * atm_iv * (T ** 0.5)
+    pts = (em or {}).get("expectedMovePts") or iv_em or 0.0
+    out = {"atmStrike": (em or {}).get("atmStrike", atm_k),
+           "straddle$": (em or {}).get("straddle"),
+           "expectedMovePts": round(pts, 1) if pts else None,
+           "expectedMovePct": round(100.0 * pts / spot, 2) if pts else None,
+           "atmIV": round(atm_iv, 4) if atm_iv else None,
+           "ivBasedMovePts": round(iv_em, 1) if iv_em else None}
+    if pts:
+        out["levels"] = {"upper1sigma": round(spot + pts, 2), "lower1sigma": round(spot - pts, 2),
+                         "upper2sigma": round(spot + 2 * pts, 2), "lower2sigma": round(spot - 2 * pts, 2)}
+    return out
+
+
+@mcp.tool()
+async def expected_move(expiration: Optional[str] = None, zero_dte: bool = True,
+                        root: str = "SPXW") -> dict:
+    """Today's implied trading range from the ATM straddle - the single most useful number for 0DTE
+    strike selection.
+
+    Returns the ATM straddle (~1-sigma move for the session), the IV-based 1-sigma, and the +/-1 and
+    +/-2 sigma price levels. Defaults to today's SPXW expiry (`zero_dte=True`).
+    """
+    try:
+        ch = await _load_chain()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    spot = ch["spot"]
+    exp = None if zero_dte else (expiration or _nearest_expiry(ch["options"], root))
+    opts = _filter(ch["options"], root=root, expiration=exp, zero_dte=zero_dte)
+    resolved = "today"
+    if not opts:
+        exp = _nearest_expiry(ch["options"], root)
+        opts = _filter(ch["options"], root=root, expiration=exp)
+        resolved = exp
+    elif not zero_dte:
+        resolved = exp
+    if not opts:
+        return {"error": "No contracts for that selection."}
+    em = _em_levels(spot, opts, None if resolved == "today" else resolved)
+    return {"root": root.upper(), "expiration": resolved, "spot": round(spot, 2),
+            "asof": ch.get("asof"), **em}
+
+
+@mcp.tool()
+async def strike_probabilities(expiration: Optional[str] = None, zero_dte: bool = True,
+                               root: str = "SPXW",
+                               width_pct: Annotated[float, Field(ge=0.2, le=10.0)] = 2.0,
+                               strikes: Optional[str] = None) -> dict:
+    """Risk-neutral probability that each strike finishes in-the-money, plus an estimated probability
+    of touching it before expiry - for sizing short-strike risk on 0DTE.
+
+    Computes prob-ITM = N(d2) (calls) / N(-d2) (puts) from each strike's IV, and prob-touch ~= 2x the
+    finish-OTM probability. Defaults to a grid within +/-`width_pct` of spot for today's SPXW expiry;
+    pass `strikes` as a comma list to target specific ones.
+    """
+    try:
+        ch = await _load_chain()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    spot = ch["spot"]
+    exp = None if zero_dte else (expiration or _nearest_expiry(ch["options"], root))
+    opts = _filter(ch["options"], root=root, expiration=exp, zero_dte=zero_dte)
+    resolved = "today"
+    if not opts:
+        exp = _nearest_expiry(ch["options"], root)
+        opts = _filter(ch["options"], root=root, expiration=exp)
+        resolved = exp
+    elif not zero_dte:
+        resolved = exp
+    if not opts:
+        return {"error": "No contracts for that selection."}
+    exp_for_T = _today_et().isoformat() if resolved == "today" else resolved
+    T = _year_frac(exp_for_T)
+    want = None
+    if strikes:
+        want = set()
+        for s in strikes.split(","):
+            try:
+                want.add(round(float(s.strip()), 2))
+            except ValueError:
+                pass
+    lo, hi = spot * (1 - width_pct / 100.0), spot * (1 + width_pct / 100.0)
+    from collections import defaultdict
+    by = defaultdict(dict)
+    for o in opts:
+        if o.get("iv", 0) > 0:
+            by[o["strike"]][o["cp"]] = o
+    rows = []
+    for k in sorted(by.keys()):
+        if want is not None:
+            if round(k, 2) not in want:
+                continue
+        elif not (lo <= k <= hi):
+            continue
+        row = {"strike": k, "vsSpot": round(k - spot, 1)}
+        sqrtT = T ** 0.5
+        # one touch probability per strike (depends on strike vs spot, not call/put)
+        ivk = None
+        for side in ("C", "P"):
+            if by[k].get(side):
+                ivk = by[k][side]["iv"]
+                break
+        if ivk and abs(k - spot) > 1e-6:
+            d2k = (np.log(spot / k) + (RISK_FREE - 0.5 * ivk * ivk) * T) / (ivk * sqrtT)
+            p_beyond = float(_norm_cdf(np.array([d2k if k >= spot else -d2k]))[0])  # P(S_T past K)
+            row["probTouch%"] = round(min(1.0, 2.0 * p_beyond) * 100.0, 1)
+        else:
+            row["probTouch%"] = 100.0
+        for side in ("C", "P"):
+            o = by[k].get(side)
+            if not o:
+                continue
+            iv = o["iv"]
+            d2 = (np.log(spot / k) + (RISK_FREE - 0.5 * iv * iv) * T) / (iv * sqrtT)
+            p_itm = float(_norm_cdf(np.array([d2 if side == "C" else -d2]))[0])
+            row[side] = {"probITM%": round(100.0 * p_itm, 1),
+                         "delta": round(o.get("delta", 0.0), 3), "iv": round(iv, 4)}
+        rows.append(row)
+    return {"root": root.upper(), "expiration": resolved, "spot": round(spot, 2),
+            "asof": ch.get("asof"), "strikes": rows}
+
+
+@mcp.tool()
+async def daily_game_plan(root: str = "SPXW") -> dict:
+    """One call for today's 0DTE map: spot, expected-move bands, gamma regime + flip, call/put walls,
+    high-OI pins, and max-pain - assembled into support/resistance you can trade against.
+
+    Resistance = call wall / +sigma / high call OI; support = put wall / -sigma / high put OI; pivots =
+    max-pain, gamma flip, spot. SPX pins toward max-pain and gamma walls into the close on long-gamma days.
+    """
+    try:
+        ch = await _load_chain()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    spot = ch["spot"]
+    opts = _filter(ch["options"], root=root, zero_dte=True)
+    resolved, note = "today", None
+    if not opts:
+        exp = _nearest_expiry(ch["options"], root)
+        opts = _filter(ch["options"], root=root, expiration=exp)
+        resolved, note = exp, f"Nothing expires today; using nearest expiry {exp}."
+    comp = _gex_components(spot, opts)
+    if not comp:
+        return {"error": "No valid contracts (need OI and IV)."}
+    flip = _gamma_flip(spot, comp)
+    call, put, net = _per_strike(comp)
+    cw = max(({k: v for k, v in call.items() if k >= spot}).items(), key=lambda kv: kv[1], default=None)
+    pw = max(({k: v for k, v in put.items() if k <= spot}).items(), key=lambda kv: kv[1], default=None)
+    mp = _max_pain(opts)
+    em = _em_levels(spot, opts, None if resolved == "today" else resolved)
+    # high open-interest strikes by side
+    oi_c = sorted(((o["strike"], o["oi"]) for o in opts if o["cp"] == "C" and o["oi"] > 0),
+                  key=lambda x: x[1], reverse=True)[:3]
+    oi_p = sorted(((o["strike"], o["oi"]) for o in opts if o["cp"] == "P" and o["oi"] > 0),
+                  key=lambda x: x[1], reverse=True)[:3]
+    total = comp["total"]
+    em_lv = em.get("levels") or {}
+    resistance = sorted({x for x in [cw[0] if cw else None, em_lv.get("upper1sigma"),
+                                     oi_c[0][0] if oi_c else None] if x and x > spot}, )
+    support = sorted({x for x in [pw[0] if pw else None, em_lv.get("lower1sigma"),
+                                  oi_p[0][0] if oi_p else None] if x and x < spot}, reverse=True)
+    out = {"root": root.upper(), "expiration": resolved, "spot": round(spot, 2), "asof": ch.get("asof"),
+           "regime": "long gamma (pin / mean-revert)" if total > 0 else "short gamma (trend / amplify)",
+           "totalGEX_$mm_per_1pct": _mm(total),
+           "gammaFlip": round(flip, 2) if flip else None,
+           "expectedMove": {"pts": em.get("expectedMovePts"), "pct": em.get("expectedMovePct"),
+                            "upper": em_lv.get("upper1sigma"), "lower": em_lv.get("lower1sigma")},
+           "callWall": cw[0] if cw else None, "putWall": pw[0] if pw else None,
+           "maxPain": mp,
+           "highOI_calls": [{"strike": k, "oi": int(v)} for k, v in oi_c],
+           "highOI_puts": [{"strike": k, "oi": int(v)} for k, v in oi_p],
+           "map": {"resistance": resistance, "pivots": sorted({x for x in [mp, round(flip, 0) if flip else None,
+                                                                           round(spot, 0)] if x}),
+                   "support": support}}
+    if note:
+        out["note"] = note
+    return out
+
+
 def main() -> None:
     log.info("Starting Traders Edge MCP server (stdio); risk-free=%.3f", RISK_FREE)
     mcp.run()

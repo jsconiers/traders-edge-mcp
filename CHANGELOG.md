@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.5.0] - 2026-06-19
+
+### Added
+- **Discipline / anti-overtrading layer (3 tools).** `daily_pnl_curve` (realized-P&L curve from
+  Robinhood fills with target-cross + give-back), `daily_review` (win rate, expectancy, profit factor,
+  P&L by hour, before-vs-after-target split), and `should_i_trade` (real-time GO/CAUTION/STOP gate).
+  Realized P&L is netted from `net_amount` (fees included) with FIFO open->close round-trip matching.
+- **0DTE decision support (3 tools).** `expected_move` (ATM-straddle range + sigma levels),
+  `strike_probabilities` (per-strike prob-ITM and prob-of-touch), and `daily_game_plan` (expected move
+  + gamma flip/walls + max-pain + high-OI pins -> support/resistance). 39 tools total.
+
+### Notes
+- Discipline tools assume manual closes (the 0DTE scalping style); a recon note flags any expired or
+  still-open positions where net cash flow diverges from round-trip realized P&L.
+- Tunables: `TE_GIVEBACK_FRAC` (0.40), `TE_RAPID_REENTRY_SECS` (90), `TE_LATE_SESSION_ET` (15:45).
+
 ## [0.4.0] - 2026-06-19
 
 ### Added

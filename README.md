@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (33)
+## Tools (39)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -43,6 +43,13 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 | `next_event` | The single next macro event with an ET countdown. |
 
 Plus `traders_edge_status` (health check / current spot).
+
+### 0DTE decision support
+| Tool | What it does |
+|------|--------------|
+| `expected_move` | ATM-straddle implied range (~1-sigma) for the session, plus +/-1 & +/-2 sigma levels and the IV-based move. |
+| `strike_probabilities` | Per-strike risk-neutral prob-ITM and prob-of-touch (Black-Scholes from each strike's IV). |
+| `daily_game_plan` | One call for today's 0DTE map: expected-move bands + gamma flip/walls + max-pain + high-OI pins, assembled into support/resistance. |
 
 ### Tier 2 — Macro context (FRED, key-less)
 | Tool | What it does |
@@ -101,6 +108,17 @@ Example positions file:
   {"broker": "robinhood", "symbol": "SPXW260620P07400000", "qty": -2, "type": "option"}
 ]}
 ```
+
+### Discipline / behavioral (Robinhood fills)
+| Tool | What it does |
+|------|--------------|
+| `daily_pnl_curve` | Realized-P&L curve from your option fills (net of fees), with the target-cross marked and the give-back-after-target quantified. |
+| `daily_review` | End-of-day scorecard: win rate, expectancy, profit factor, P&L by hour, and the before-vs-after-target split. |
+| `should_i_trade` | Real-time GO / CAUTION / STOP gate from past-target status, give-back from peak, consecutive losses, churning, and time-of-session. |
+
+Realized P&L is reconstructed from Robinhood option fills (`net_amount`, fees included) with round trips
+matched open->close FIFO. These tools target the logged pattern of giving back gains after hitting target;
+a recon note flags any day where positions expired or remain open (net cash flow != round-trip realized).
 
 ## Data sources (no API key required)
 
