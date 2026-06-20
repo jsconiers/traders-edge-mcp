@@ -1,0 +1,10 @@
+{
+  "daily_target": 500,
+  "weekly_target": null,
+  "giveback_frac": 0.4,
+  "rapid_reentry_secs": 90,
+  "late_session_et": "15:45",
+  "max_trades_per_day": null,
+  "roll_delta": 0.45,
+  "roll_dte": 7
+}

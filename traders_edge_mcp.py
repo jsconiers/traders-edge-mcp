@@ -2052,7 +2052,7 @@ async def daily_target(
     estimated from Alpaca as account equity minus prior-day equity. If you're already past target, this
     flags it - your logged history shows post-target trades have generated most of your losses.
     """
-    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    tgt = float(target) if target is not None else _target()
     src = "provided"
     rpl = realized_pl
     if rpl is None:
@@ -2213,7 +2213,8 @@ def _round_trips(fills: list) -> list:
                 trips.append({"open": lot_time, "close": f["time"], "chain": f.get("chain"),
                               "strike": f.get("strike"), "cp": f.get("cp"), "qty": take,
                               "pnl": take * (open_per + close_per),
-                              "holdSec": (f["time"] - lot_time).total_seconds()})
+                              "holdSec": (f["time"] - lot_time).total_seconds(),
+                              "expiry": f.get("expiry"), "option_id": oid})
                 lot_qty -= take
                 lot[0], lot[1] = lot_qty, lot_cost - open_per * take
                 remaining -= take
@@ -2232,7 +2233,7 @@ async def daily_pnl_curve(date: Optional[str] = None, target: Optional[float] = 
     costs you money. `date` (YYYY-MM-DD ET) defaults to today; `full=True` returns every fill row.
     """
     d = date or _today_et().isoformat()
-    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    tgt = float(target) if target is not None else _target()
     try:
         fills = await _day_fills(d)
     except EdgeError as exc:
@@ -2281,7 +2282,7 @@ async def daily_review(date: Optional[str] = None, target: Optional[float] = Non
     (YYYY-MM-DD ET) defaults to today.
     """
     d = date or _today_et().isoformat()
-    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    tgt = float(target) if target is not None else _target()
     try:
         fills = await _day_fills(d)
     except EdgeError as exc:
@@ -2351,7 +2352,10 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     queryable mid-session. Time-based signals assume `date` is today (the default).
     """
     d = date or _today_et().isoformat()
-    tgt = float(target) if target is not None else DAILY_TARGET_DEFAULT
+    tgt = float(target) if target is not None else _target()
+    giveback_frac = float(_cfg("giveback_frac"))
+    rapid_secs = float(_cfg("rapid_reentry_secs"))
+    late_et = str(_cfg("late_session_et"))
     is_today = (d == _today_et().isoformat())
     try:
         fills = await _day_fills(d)
@@ -2367,7 +2371,7 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     reasons, flags = [], []
 
     past_target = total >= tgt and tgt > 0
-    giveback = peak >= tgt and (peak - total) >= DD_GIVEBACK_FRAC * tgt
+    giveback = peak >= tgt and (peak - total) >= giveback_frac * tgt
     last3 = trips[-3:]
     consec_losses = len(last3) >= 3 and all(t["pnl"] < 0 for t in last3)
     consec2 = len(trips) >= 2 and all(t["pnl"] < 0 for t in trips[-2:])
@@ -2377,8 +2381,8 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     rapid = False
     if len(opens) >= 3:
         gaps = [(opens[i] - opens[i - 1]).total_seconds() for i in range(-2, 0)]
-        rapid = all(g < RAPID_REENTRY_SECS for g in gaps)
-    lh, lm = (int(x) for x in LATE_SESSION_ET.split(":"))
+        rapid = all(g < rapid_secs for g in gaps)
+    lh, lm = (int(x) for x in late_et.split(":"))
     late = is_today and (now.hour, now.minute) >= (lh, lm) and now.hour < 16
 
     if past_target:
@@ -2394,7 +2398,7 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
         reasons.append("Last 3 round trips were all losers - classic tilt setup.")
     if rapid:
         flags.append("RAPID_REENTRY")
-        reasons.append(f"Last entries were <{int(RAPID_REENTRY_SECS)}s apart - you're churning, not "
+        reasons.append(f"Last entries were <{int(rapid_secs)}s apart - you're churning, not "
                        f"waiting for setups.")
     if deep_dd:
         flags.append("DEEP_DRAWDOWN")
@@ -2910,6 +2914,541 @@ async def regime_classifier() -> dict:
     return {"asof": "CBOE ~15-min + FRED daily", "regime": regime, "compositeScore": score,
             "factorsScored": n, "avgFactor": round(score / n, 2) if n else 0.0,
             "posture": posture, "factors": factors}
+
+
+# ============================================================================
+# USER CONFIG (goals / discipline tunables): JSON file, env overrides, live reload
+# ============================================================================
+TE_CONFIG_PATH = os.environ.get(
+    "TE_CONFIG_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
+
+_CONFIG_DEFAULTS = {
+    "daily_target": 524.0,        # $ profit target per trading day
+    "weekly_target": None,        # optional $ weekly target (informational)
+    "giveback_frac": 0.40,        # give-back from intraday peak (x target) -> STOP
+    "rapid_reentry_secs": 90.0,   # entries closer than this flag churning
+    "late_session_et": "15:45",   # final-stretch CAUTION after this ET time
+    "max_trades_per_day": None,   # optional round-trip cap (informational)
+    "roll_delta": 0.45,           # covered-call roll trigger: |delta| >=
+    "roll_dte": 7,                # covered-call roll trigger: DTE <=
+}
+_CONFIG_ENV = {
+    "daily_target": "DAILY_TARGET",
+    "giveback_frac": "TE_GIVEBACK_FRAC",
+    "rapid_reentry_secs": "TE_RAPID_REENTRY_SECS",
+    "late_session_et": "TE_LATE_SESSION_ET",
+}
+_config_cache = {"mtime": None, "data": {}}
+
+
+def _load_config() -> dict:
+    """Read config.json, cached by mtime. Returns {} if missing/invalid."""
+    import json
+    try:
+        st = os.stat(TE_CONFIG_PATH)
+    except OSError:
+        _config_cache["mtime"], _config_cache["data"] = None, {}
+        return {}
+    if _config_cache["mtime"] == st.st_mtime:
+        return _config_cache["data"]
+    try:
+        with open(TE_CONFIG_PATH) as f:
+            data = json.load(f)
+        data = data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        data = {}
+    _config_cache["mtime"], _config_cache["data"] = st.st_mtime, data
+    return data
+
+
+def _coerce(raw, base):
+    if isinstance(base, bool):
+        return str(raw).lower() in ("1", "true", "yes", "on")
+    try:
+        if isinstance(base, float):
+            return float(raw)
+        if isinstance(base, int):
+            return int(raw)
+    except (TypeError, ValueError):
+        return base
+    return raw
+
+
+def _cfg(key, default=None):
+    """Resolve a setting. Precedence: env var > config.json > built-in default."""
+    base = _CONFIG_DEFAULTS.get(key, default)
+    env = _CONFIG_ENV.get(key)
+    if env:
+        raw = os.environ.get(env)
+        if raw not in (None, ""):
+            return _coerce(raw, base if base is not None else default)
+    cfg = _load_config()
+    if cfg.get(key) is not None:
+        return cfg[key]
+    return base
+
+
+def _cfg_source(key) -> str:
+    env = _CONFIG_ENV.get(key)
+    if env and os.environ.get(env) not in (None, ""):
+        return f"env:{env}"
+    if _load_config().get(key) is not None:
+        return "config.json"
+    return "default"
+
+
+def _target() -> float:
+    try:
+        return float(_cfg("daily_target", 524.0))
+    except (TypeError, ValueError):
+        return 524.0
+
+
+@mcp.tool()
+async def trading_config(action: str = "show", key: Optional[str] = None,
+                         value: Optional[str] = None) -> dict:
+    """View or change your Traders Edge goals/discipline settings (config.json), live - no restart.
+
+    `action='show'` (default) lists every setting, its effective value, and source (env / config /
+    default). `action='set'` with `key` and `value` writes to config.json (e.g. key='daily_target',
+    value='550'). `action='reset'` with `key` removes it. Env vars, if set, always win over the file.
+    Editable keys: daily_target, weekly_target, giveback_frac, rapid_reentry_secs, late_session_et,
+    max_trades_per_day, roll_delta, roll_dte.
+    """
+    import json
+    keys = list(_CONFIG_DEFAULTS.keys())
+    if action == "show":
+        eff = {k: {"value": _cfg(k), "default": _CONFIG_DEFAULTS[k], "source": _cfg_source(k)}
+               for k in keys}
+        return {"configFile": TE_CONFIG_PATH, "exists": os.path.exists(TE_CONFIG_PATH),
+                "settings": eff}
+    if action in ("set", "reset"):
+        if not key or key not in _CONFIG_DEFAULTS:
+            return {"error": f"Unknown key '{key}'. Editable keys: {keys}"}
+        cfg = dict(_load_config())
+        note = None
+        if action == "set":
+            if value is None:
+                return {"error": "Provide `value` to set."}
+            base = _CONFIG_DEFAULTS[key]
+            cfg[key] = (None if str(value).lower() in ("null", "none", "")
+                        else _coerce(value, base if base is not None else 0.0))
+            if _CONFIG_ENV.get(key) and os.environ.get(_CONFIG_ENV[key]) not in (None, ""):
+                note = (f"Note: env var {_CONFIG_ENV[key]} is set and overrides config.json for this "
+                        f"key until unset.")
+        else:
+            cfg.pop(key, None)
+        try:
+            os.makedirs(os.path.dirname(TE_CONFIG_PATH), exist_ok=True)
+            with open(TE_CONFIG_PATH, "w") as f:
+                json.dump(cfg, f, indent=2)
+            _config_cache["mtime"] = None
+        except OSError as exc:
+            return {"error": f"Could not write config: {exc}"}
+        out = {"action": action, "key": key, "newEffectiveValue": _cfg(key),
+               "source": _cfg_source(key), "configFile": TE_CONFIG_PATH}
+        if note:
+            out["note"] = note
+        return out
+    return {"error": "action must be 'show', 'set', or 'reset'."}
+
+
+# ============================================================================
+# DISCIPLINE BACKTEST - replay fills through the stop-at-target rule
+# ============================================================================
+_WD_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+@mcp.tool()
+async def discipline_backtest(lookback_days: Annotated[int, Field(ge=5, le=400)] = 90,
+                              target: Optional[float] = None) -> dict:
+    """Replay your real fills through the stop-at-target rule: how much would stopping each day at your
+    target have changed realized P&L vs what you actually did?
+
+    For every trading day in the window it rebuilds round trips, finds the target cross, and compares
+    actual P&L to 'stopped at target' P&L. Aggregates the after-target leak, win rate, expectancy, an
+    equity curve, and by-day-of-week / by-hour breakdowns. The headline is the dollar value of discipline.
+    """
+    import asyncio
+    from collections import defaultdict
+    tgt = float(target) if target is not None else _target()
+    stop = _today_et() - _dt.timedelta(days=lookback_days)
+    stop_iso = stop.isoformat()
+    try:
+        orders = await asyncio.to_thread(_rh_recent_option_orders, stop, 30)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    fills_by_day = defaultdict(list)
+    for o in orders:
+        f = _order_to_fill(o)
+        if f and f["trade_date"] >= stop_iso:
+            fills_by_day[f["trade_date"]].append(f)
+    if not fills_by_day:
+        return {"note": f"No fills in the last {lookback_days} days.", "target$": tgt}
+
+    days, equity, all_trips = [], [], []
+    dow = defaultdict(lambda: {"pnl": 0.0, "days": 0})
+    hour = defaultdict(lambda: {"pnl": 0.0, "n": 0})
+    cum_actual = 0.0
+    for date in sorted(fills_by_day.keys()):
+        fills = sorted(fills_by_day[date], key=lambda r: r["time"])
+        trips = _round_trips(fills)
+        if not trips:
+            continue
+        all_trips.extend(trips)
+        cur = _build_curve(trips, tgt)
+        actual = cur["total"]
+        crossed = cur["crossIdx"] is not None
+        hypo = cur["crossCum"] if crossed else actual
+        after = (actual - cur["crossCum"]) if crossed else 0.0
+        cum_actual += actual
+        equity.append({"date": date, "pnl$": round(actual, 2), "cum$": round(cum_actual, 2)})
+        wd = _dt.date.fromisoformat(date).strftime("%a")
+        dow[wd]["pnl"] += actual
+        dow[wd]["days"] += 1
+        for tr in trips:
+            h = tr["close"].astimezone(ET).strftime("%H:00")
+            hour[h]["pnl"] += tr["pnl"]
+            hour[h]["n"] += 1
+        days.append({"date": date, "actual$": round(actual, 2), "hitTarget": crossed,
+                     "targetTime": (_fmt_et(cur["crossTime"]) if crossed else None),
+                     "afterTarget$": round(after, 2), "stopAtTarget$": round(hypo, 2),
+                     "trips": len(trips)})
+
+    actual_total = sum(d["actual$"] for d in days)
+    hypo_total = sum(d["stopAtTarget$"] for d in days)
+    hit = [d for d in days if d["hitTarget"]]
+    gave_back = [d for d in hit if d["afterTarget$"] < 0]
+    added = [d for d in hit if d["afterTarget$"] > 0]
+    wins = [t for t in all_trips if t["pnl"] > 0]
+    losses = [t for t in all_trips if t["pnl"] < 0]
+    gw = sum(t["pnl"] for t in wins)
+    gl = -sum(t["pnl"] for t in losses)
+    n = len(all_trips)
+    delta = hypo_total - actual_total
+    return {
+        "window": f"{stop_iso} -> {_today_et().isoformat()} ({lookback_days}d)",
+        "target$": round(tgt, 2), "tradingDays": len(days),
+        "actualRealized$": round(actual_total, 2),
+        "stopAtTargetRealized$": round(hypo_total, 2),
+        "disciplineDelta$": round(delta, 2),
+        "verdict": (f"Stopping at ${tgt:.0f} each day would have changed realized P&L by ${delta:+.2f} "
+                    f"over {len(days)} days "
+                    f"({'discipline wins' if delta > 0 else 'after-target trades were net positive here'})."),
+        "daysHitTarget": len(hit), "daysContinuedAndLost": len(gave_back),
+        "daysContinuedAndGained": len(added),
+        "afterTargetNet$": round(sum(d["afterTarget$"] for d in hit), 2),
+        "afterTargetLeakLosingDays$": round(sum(d["afterTarget$"] for d in gave_back), 2),
+        "roundTrips": n, "winRate%": round(100.0 * len(wins) / n, 1) if n else None,
+        "expectancyPerTrade$": round((gw - gl) / n, 2) if n else None,
+        "profitFactor": round(gw / gl, 2) if gl > 0 else None,
+        "bestDay": max(days, key=lambda d: d["actual$"]) if days else None,
+        "worstDay": min(days, key=lambda d: d["actual$"]) if days else None,
+        "byDayOfWeek": {k: {"pnl$": round(dow[k]["pnl"], 2), "days": dow[k]["days"],
+                            "avg$": round(dow[k]["pnl"] / dow[k]["days"], 2)}
+                        for k in _WD_ORDER if k in dow},
+        "byHour": {k: {"pnl$": round(hour[k]["pnl"], 2), "trades": hour[k]["n"]}
+                   for k in sorted(hour)},
+        "equityCurve": equity,
+    }
+
+
+# ============================================================================
+# TAX SUMMARY - realized options P&L + wash-sale candidates (CPA hand-off)
+# ============================================================================
+@mcp.tool()
+async def tax_summary(year: Optional[int] = None) -> dict:
+    """Realized options P&L for the year plus wash-sale candidates - a hand-off for your CPA.
+
+    Reconstructs closed round trips (FIFO) from your Robinhood option fills: total realized, short-term
+    vs long-term, by month, gross gains/losses. Flags identical-contract wash-sale candidates (a
+    realized loss where the same contract was re-opened within 30 days after the loss). Options only;
+    not tax advice - verify against your 1099-B.
+    """
+    import asyncio
+    from collections import defaultdict
+    yr = int(year) if year else _today_et().year
+    jan1 = _dt.date(yr, 1, 1)
+    try:
+        orders = await asyncio.to_thread(_rh_recent_option_orders, jan1, 40)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    fills = []
+    for o in orders:
+        f = _order_to_fill(o)
+        if f:
+            fills.append(f)
+    fills.sort(key=lambda r: r["time"])
+    trips = _round_trips(fills)
+    yr_trips = [t for t in trips if t["close"].astimezone(ET).year == yr]
+    if not yr_trips:
+        return {"year": yr, "note": "No closed option round trips this year."}
+    wins = [t for t in yr_trips if t["pnl"] > 0]
+    losses = [t for t in yr_trips if t["pnl"] < 0]
+    st = [t for t in yr_trips if (t["close"] - t["open"]).days <= 365]
+    lt = [t for t in yr_trips if (t["close"] - t["open"]).days > 365]
+    by_month = defaultdict(lambda: {"pnl": 0.0, "n": 0})
+    for t in yr_trips:
+        m = t["close"].astimezone(ET).strftime("%Y-%m")
+        by_month[m]["pnl"] += t["pnl"]
+        by_month[m]["n"] += 1
+    opens_by_contract = defaultdict(list)
+    for f in fills:
+        if f.get("effect") == "open" and f.get("option_id"):
+            opens_by_contract[f["option_id"]].append(f["time"])
+    wash = []
+    for t in losses:
+        oid, cd = t.get("option_id"), t["close"]
+        for ot in opens_by_contract.get(oid, []):
+            if cd < ot and (ot - cd).days <= 30:
+                wash.append({"contract": f"{t['chain']} {t.get('strike')}{t.get('cp')} {t.get('expiry')}",
+                             "lossCloseDate": cd.astimezone(ET).date().isoformat(),
+                             "loss$": round(t["pnl"], 2),
+                             "reopenDate": ot.astimezone(ET).date().isoformat()})
+                break
+    return {
+        "year": yr, "asof": _today_et().isoformat(), "scope": "Robinhood options only (not tax advice)",
+        "realizedTotal$": round(sum(t["pnl"] for t in yr_trips), 2),
+        "shortTerm$": round(sum(t["pnl"] for t in st), 2), "shortTermTrips": len(st),
+        "longTerm$": round(sum(t["pnl"] for t in lt), 2), "longTermTrips": len(lt),
+        "roundTrips": len(yr_trips), "wins": len(wins), "losses": len(losses),
+        "grossGains$": round(sum(t["pnl"] for t in wins), 2),
+        "grossLosses$": round(sum(t["pnl"] for t in losses), 2),
+        "byMonth": {k: {"pnl$": round(by_month[k]["pnl"], 2), "trips": by_month[k]["n"]}
+                    for k in sorted(by_month)},
+        "washSaleCandidates": wash,
+        "washSaleNote": ("Identical-contract re-opens within 30 days after a realized loss. For 0DTE this "
+                         "is usually rare (an expired contract can't be re-opened); a near-zero count is "
+                         "expected. Different strikes/expiries may still warrant CPA review under the "
+                         "substantially-identical rule. Stock lots are not included."),
+    }
+
+
+# ============================================================================
+# SNAPSHOT LOGGER (SQLite) - intraday GEX / level migration
+# ============================================================================
+TE_DB_PATH = os.environ.get("TE_DB_PATH",
+                            os.path.join(os.path.expanduser("~"), ".trading", "traders_edge.db"))
+
+
+def _db_conn():
+    import sqlite3
+    os.makedirs(os.path.dirname(TE_DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(TE_DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS snapshots (
+        ts TEXT, date TEXT, spot REAL, total_gex REAL, gamma_flip REAL, call_wall REAL,
+        put_wall REAL, max_pain REAL, expected_move REAL, vix REAL, vix1d REAL,
+        regime TEXT, regime_score INTEGER)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_snap_date ON snapshots(date)")
+    return conn
+
+
+def _snapshot_write_sync(row: dict) -> None:
+    conn = _db_conn()
+    with conn:
+        conn.execute(
+            "INSERT INTO snapshots VALUES (:ts,:date,:spot,:total_gex,:gamma_flip,:call_wall,"
+            ":put_wall,:max_pain,:expected_move,:vix,:vix1d,:regime,:regime_score)", row)
+    conn.close()
+
+
+def _snapshot_read_sync(date_iso: str) -> list:
+    conn = _db_conn()
+    cur = conn.execute(
+        "SELECT ts,spot,total_gex,gamma_flip,call_wall,put_wall,max_pain,expected_move,"
+        "vix,vix1d,regime,regime_score FROM snapshots WHERE date=? ORDER BY ts", (date_iso,))
+    cols = [c[0] for c in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+@mcp.tool()
+async def snapshot_log() -> dict:
+    """Capture the current 0DTE state (spot, total GEX, gamma flip, call/put walls, max-pain, expected
+    move, VIX/VIX1D, regime) to a local SQLite log for intraday trend tracking.
+
+    Call periodically through the session; `snapshot_history` then shows how dealer gamma and the key
+    levels drifted (GEX migration). Stored at ~/.trading/traders_edge.db.
+    """
+    import asyncio
+    z, vx, rg = await asyncio.gather(zero_dte_exposure(), vix_complex(), regime_classifier())
+    if isinstance(z, dict) and "error" in z:
+        return {"error": f"chain unavailable: {z['error']}"}
+    em = z.get("expectedMove") or {}
+    idx = (vx.get("indices") or {}) if isinstance(vx, dict) else {}
+    cw, pw = z.get("callWall"), z.get("putWall")
+    now = _dt.datetime.now(ET)
+    row = {
+        "ts": now.isoformat(), "date": now.date().isoformat(),
+        "spot": z.get("spot"), "total_gex": z.get("totalGEX"), "gamma_flip": z.get("gammaFlip"),
+        "call_wall": cw.get("strike") if isinstance(cw, dict) else None,
+        "put_wall": pw.get("strike") if isinstance(pw, dict) else None,
+        "max_pain": z.get("maxPainPin"), "expected_move": em.get("expectedMovePts"),
+        "vix": (idx.get("VIX") or {}).get("value"), "vix1d": (idx.get("VIX1D") or {}).get("value"),
+        "regime": rg.get("regime") if isinstance(rg, dict) else None,
+        "regime_score": rg.get("compositeScore") if isinstance(rg, dict) else None,
+    }
+    try:
+        await asyncio.to_thread(_snapshot_write_sync, row)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"DB write failed: {str(exc)[:160]}"}
+    return {"logged": True, "db": TE_DB_PATH,
+            "snapshot": {k: row[k] for k in ("ts", "spot", "total_gex", "gamma_flip", "call_wall",
+                                             "put_wall", "max_pain", "expected_move", "vix", "vix1d",
+                                             "regime", "regime_score")}}
+
+
+@mcp.tool()
+async def snapshot_history(date: Optional[str] = None) -> dict:
+    """Read back the day's logged snapshots and summarize how key levels drifted - the intraday GEX
+    migration and where dealer positioning moved.
+
+    Returns each snapshot plus first/last/min/max and net change for spot, total GEX, gamma flip, and
+    call/put walls. `date` (YYYY-MM-DD ET) defaults to today. Requires prior `snapshot_log` calls.
+    """
+    import asyncio
+    d = date or _today_et().isoformat()
+    try:
+        rows = await asyncio.to_thread(_snapshot_read_sync, d)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"DB read failed: {str(exc)[:160]}"}
+    if not rows:
+        return {"date": d, "note": "No snapshots logged for this date. Call snapshot_log during the session."}
+
+    def drift(field):
+        nums = [r[field] for r in rows if r[field] is not None]
+        if not nums:
+            return None
+        return {"first": nums[0], "last": nums[-1], "min": min(nums), "max": max(nums),
+                "change": round(nums[-1] - nums[0], 2)}
+
+    fmt = [{"t": (r["ts"][11:19] if r["ts"] else None), "spot": r["spot"], "gex": r["total_gex"],
+            "flip": r["gamma_flip"], "callWall": r["call_wall"], "putWall": r["put_wall"],
+            "vix": r["vix"], "regime": r["regime"]} for r in rows]
+    return {"date": d, "snapshots": len(rows),
+            "drift": {k: drift(k) for k in ("spot", "total_gex", "gamma_flip", "call_wall",
+                                            "put_wall", "vix")},
+            "rows": fmt}
+
+
+# ============================================================================
+# ROLL-CANDIDATE FINDER - roll up-and-out targets for covered calls
+# ============================================================================
+def _roll_scan_sync(symbol: str, cur_strike: float, cur_expiry: str, min_dte: int,
+                    max_dte: int, target_delta: float, n_per_expiry: int) -> dict:
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    px = None
+    try:
+        lp = rh.get_latest_price(symbol)
+        px = float(lp[0]) if lp else None
+    except Exception:  # noqa: BLE001
+        px = None
+    try:
+        ch = rh.options.get_chains(symbol)
+        exps = ch.get("expiration_dates", []) if isinstance(ch, dict) else []
+    except Exception:  # noqa: BLE001
+        exps = []
+    today = _today_et()
+    try:
+        cur_exp_d = _dt.date.fromisoformat(cur_expiry)
+    except Exception:  # noqa: BLE001
+        cur_exp_d = today
+    targets = []
+    for e in exps:
+        try:
+            ed = _dt.date.fromisoformat(e)
+        except Exception:  # noqa: BLE001
+            continue
+        dte = (ed - today).days
+        if ed > cur_exp_d and min_dte <= dte <= max_dte:
+            targets.append((e, dte))
+    targets = targets[:2]
+    cur_mark = None
+    try:
+        md = rh.options.find_options_by_expiration_and_strike(
+            symbol, cur_expiry, str(cur_strike), "call")
+        if md:
+            cur_mark = (float(md[0].get("mark_price") or md[0].get("adjusted_mark_price") or 0)
+                        or None)
+    except Exception:  # noqa: BLE001
+        cur_mark = None
+    cands = []
+    for e, dte in targets:
+        try:
+            calls = rh.options.find_options_by_expiration(
+                symbol, expirationDate=e, optionType="call") or []
+        except Exception:  # noqa: BLE001
+            continue
+        rows = []
+        for o in calls:
+            try:
+                k = float(o.get("strike_price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if k < cur_strike:
+                continue
+            mark = float(o.get("mark_price") or o.get("adjusted_mark_price") or 0)
+            delta = float(o.get("delta") or 0)
+            rows.append((k, mark, delta, float(o.get("implied_volatility") or 0),
+                         float(o.get("open_interest") or 0)))
+        rows.sort(key=lambda r: abs(r[2] - target_delta))
+        for k, mark, delta, iv, oi in rows[:n_per_expiry]:
+            net_credit = (mark - cur_mark) if cur_mark is not None else None
+            ann = ((mark / px) * (365.0 / dte) * 100.0) if (px and dte > 0) else None
+            cands.append({"expiry": e, "dte": dte, "strike": k, "mark$/sh": round(mark, 2),
+                          "delta": round(delta, 3), "iv": round(iv, 4), "oi": int(oi),
+                          "netCreditVsClose$/sh": (round(net_credit, 2) if net_credit is not None else None),
+                          "annYield%": round(ann, 1) if ann is not None else None})
+    cands.sort(key=lambda c: (-(c["netCreditVsClose$/sh"] or -1e9), c["dte"]))
+    return {"underlying": symbol, "underlyingPx": round(px, 2) if px else None,
+            "currentCall": {"strike": cur_strike, "expiry": cur_expiry,
+                            "markToClose$/sh": round(cur_mark, 2) if cur_mark else None},
+            "candidates": cands}
+
+
+@mcp.tool()
+async def roll_candidates(underlying: Optional[str] = None,
+                          current_strike: Optional[float] = None,
+                          current_expiry: Optional[str] = None,
+                          target_delta: Annotated[float, Field(ge=0.05, le=0.6)] = 0.30,
+                          min_dte: Annotated[int, Field(ge=1, le=120)] = 20,
+                          max_dte: Annotated[int, Field(ge=1, le=180)] = 45) -> dict:
+    """Suggest roll-up-and-out targets for a covered call: candidate strikes/expiries with mark, delta,
+    net credit vs closing the current call, and annualized yield.
+
+    With no args it scans your open short calls and proposes rolls for each. Or pass `underlying`,
+    `current_strike`, `current_expiry` to evaluate a specific call. Targets are expiries after the
+    current one within `min_dte`-`max_dte` days, strikes at/above current, ranked toward `target_delta`
+    then by net credit.
+    """
+    import asyncio
+    jobs = []
+    if underlying and current_strike and current_expiry:
+        jobs.append((underlying.upper(), float(current_strike), current_expiry))
+    else:
+        try:
+            pos = await _robinhood_positions()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        for p in pos:
+            if (p.get("type") == "option" and p.get("cp") == "C" and (p.get("qty") or 0) < 0
+                    and p.get("underlying") and p.get("strike") and p.get("expiry")):
+                jobs.append((p["underlying"], p["strike"], p["expiry"]))
+        if not jobs:
+            return {"note": "No short calls open and no explicit call specified. Pass underlying, "
+                            "current_strike, current_expiry to evaluate a hypothetical roll."}
+    results = []
+    for sym, k, e in jobs[:5]:
+        try:
+            results.append(await asyncio.to_thread(_roll_scan_sync, sym, k, e, min_dte, max_dte,
+                                                   target_delta, 4))
+        except Exception as exc:  # noqa: BLE001
+            results.append({"underlying": sym, "error": str(exc)[:140]})
+    return {"rollTargets": {"minDte": min_dte, "maxDte": max_dte, "targetDelta": target_delta},
+            "results": results}
 
 
 def main() -> None:

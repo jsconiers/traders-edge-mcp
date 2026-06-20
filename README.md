@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (42)
+## Tools (48)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -126,6 +126,27 @@ a recon note flags any day where positions expired or remain open (net cash flow
 | `covered_call_manager` | Scans your Robinhood short calls: DTE, assignment prob (delta), premium captured vs extrinsic left, annualized yield, share-coverage check, earnings-before-expiry flag, and roll signals. |
 | `earnings_calendar` | Next single-name earnings for your holdings (or a symbol list): date, BMO/AMC session, days away, within-window flag; ETFs/funds listed separately. |
 | `regime_classifier` | Folds VIX + VIX term structure + NFCI + HY credit spreads + 2s10s curve + Sahm rule into one risk-on/neutral/risk-off score with a 0DTE posture. |
+
+### Performance, tax & snapshot history
+| Tool | What it does |
+|------|--------------|
+| `discipline_backtest` | Replays your fills through the stop-at-target rule: actual vs stop-at-target P&L, the after-target leak (losing days), win rate, expectancy, profit factor, an equity curve, and by-day-of-week / by-hour breakdowns. |
+| `tax_summary` | Year-to-date realized options P&L (short vs long term, by month, gross gains/losses) plus identical-contract wash-sale candidates. CPA hand-off; not tax advice. |
+| `snapshot_log` | Logs the current 0DTE state (spot, GEX, gamma flip, call/put walls, max-pain, expected move, VIX/VIX1D, regime) to local SQLite. |
+| `snapshot_history` | Reads back the day's snapshots and summarizes intraday drift — GEX migration and where the key levels moved. |
+| `roll_candidates` | Roll-up-and-out targets for a covered call: candidate strikes/expiries with mark, delta, net credit vs closing the current call, and annualized yield. |
+
+### Configuration
+| Tool | What it does |
+|------|--------------|
+| `trading_config` | View or change your goals/discipline settings (daily target, give-back %, roll thresholds…) in `config.json` — live, no restart. |
+
+Goals and discipline thresholds live in **`config.json`** next to the server (or point `TE_CONFIG_FILE`
+elsewhere). Precedence is **env var > `config.json` > built-in default**, and edits are picked up live
+(no restart). Change them by editing the file or via the tool — e.g. `trading_config(action="set",
+key="daily_target", value="550")`. Editable keys: `daily_target`, `weekly_target`, `giveback_frac`,
+`rapid_reentry_secs`, `late_session_et`, `max_trades_per_day`, `roll_delta`, `roll_dte`. See
+`config.example.json`.
 
 ## Data sources (no API key required)
 

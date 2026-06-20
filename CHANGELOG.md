@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.7.0] - 2026-06-20
+
+### Added
+- **User config file (`config.json`) + `trading_config` tool** — goals/discipline settings
+  (`daily_target`, `giveback_frac`, `rapid_reentry_secs`, `late_session_et`, `roll_delta`, `roll_dte`,
+  …) are read from a JSON file next to the server with live reload (no restart). Precedence: env var >
+  config.json > built-in default. `trading_config` shows / sets / resets keys.
+- **`discipline_backtest`** — replays your historical fills through the stop-at-target rule and reports
+  actual vs stop-at-target P&L, the after-target leak on losing days, win rate, expectancy, profit
+  factor, best/worst day, an equity curve, and by-day-of-week / by-hour breakdowns.
+- **`tax_summary`** — year-to-date realized options P&L (short vs long term, by month, gross
+  gains/losses) plus identical-contract wash-sale candidates. CPA hand-off; not tax advice.
+- **`snapshot_log` / `snapshot_history`** — log the current 0DTE state (spot, GEX, gamma flip,
+  call/put walls, max-pain, expected move, VIX/VIX1D, regime) to local SQLite and read back the day's
+  intraday drift (GEX migration). DB at `~/.trading/traders_edge.db` (override `TE_DB_PATH`).
+- **`roll_candidates`** — roll-up-and-out suggestions for a covered call: candidate strikes/expiries
+  with mark, delta, net credit vs closing the current call, and annualized yield. 48 tools total.
+
+### Changed
+- Discipline tools (`daily_target`, `daily_pnl_curve`, `daily_review`, `should_i_trade`) now resolve
+  the daily target and the give-back / rapid-reentry / late-session thresholds from the live config.
+- `_round_trips` now carries `expiry` and `option_id` per trip (contract identity for wash-sale logic).
+
 ## [0.6.0] - 2026-06-20
 
 ### Added
