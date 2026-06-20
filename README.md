@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (31)
+## Tools (32)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -68,14 +68,24 @@ Macro data is pulled key-less from the FRED fredgraph CSV endpoint.
 | `concentration` | Exposure % by underlying; flags names above the threshold (default 25%, `CONCENTRATION_PCT`). |
 | `scenario_shock` | Portfolio P&L across a set of SPX % moves (delta + gamma convexity). |
 | `daily_target` | Today's realized P&L vs your daily target (`DAILY_TARGET`, default $524), with a post-target discipline check. |
+| `robinhood_positions` | Live Robinhood holdings (stocks + option legs with broker-provided Greeks). |
 | `alpaca_positions` / `load_positions` | Raw position views from each source. |
 | `risk_status` | Which position sources are configured / reachable. |
 
-Positions come from your **Alpaca** account (live; creds via `ALPACA_ENV_FILE`, default the alpaca-mcp
-`.env`) plus a broker-agnostic **positions file** (default `~/.trading/positions.json`, override
-`POSITIONS_FILE`) for holdings held elsewhere (Robinhood, E\*TRADE, etc.). SPX/SPXW options are
-auto-priced from CBOE; equities are beta-weighted; other instruments use the optional fields you
-supply. Example positions file:
+Positions are pulled **automatically** from your **Alpaca** and **Robinhood** accounts, and can be
+supplemented with a broker-agnostic **positions file** for anything held elsewhere (E\*TRADE, etc.):
+
+- **Alpaca** — live `/v2/positions` (creds via `ALPACA_ENV_FILE`, default the alpaca-mcp `.env`).
+- **Robinhood** — stock holdings plus option legs (with broker-provided delta/gamma/theta/vega/IV) via
+  the cached `robin_stocks` session shared with the robinhood-local server. Creds from `RH_USERNAME`/
+  `RH_PASSWORD` (or `RH_ENV_FILE`, default the robinhood-local `.env`); the session pickle lives in
+  `~/.robinhood/` and refreshes every 7 days (a one-time device-approval prompt may appear in the
+  Robinhood app on first use after expiry).
+- **Positions file** — default `~/.trading/positions.json` (override `POSITIONS_FILE`).
+
+Each source can be toggled per call via `include_alpaca` / `include_robinhood` / `include_file`.
+SPX/SPXW options are auto-priced from CBOE; broker-supplied option Greeks are used directly; equities
+are beta-weighted. Example positions file:
 
 ```json
 {"positions": [

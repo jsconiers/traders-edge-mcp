@@ -1402,6 +1402,17 @@ def _position_risk(p: dict, chain_by_sym: dict, spot: float, prices: dict) -> di
         root, expiry, cp, strike = (p.get("underlying") or ""), p.get("expiry"), p.get("cp"), p.get("strike")
     cpC = (cp == "C")
     mult = 100
+    if p.get("delta") is not None and any(p.get(k) is not None for k in ("gamma", "theta", "vega")):
+        undpx = float(p.get("price") or prices.get(p.get("underlying") or root) or 0.0)
+        d = float(p["delta"]); gg = float(p.get("gamma") or 0.0)
+        th = float(p.get("theta") or 0.0); vg = float(p.get("vega") or 0.0)
+        beta = float(p.get("beta") or 1.0)
+        dd = d * qty * mult * undpx
+        return {"broker": p["broker"], "symbol": p["symbol"], "underlying": (p.get("underlying") or root),
+                "type": "option", "qty": qty, "strike": strike, "expiry": expiry, "delta$": dd,
+                "gamma$_1pct": gg * qty * mult * undpx * undpx * 0.01,
+                "theta$_day": th * qty * mult, "vega$_1pct": vg * qty * mult,
+                "betaDelta$": dd * beta, "mv": p.get("mv"), "greeksSource": "broker"}
     if root in ("SPX", "SPXW") and expiry and strike:
         o = chain_by_sym.get(p["symbol"])
         iv = float(o["iv"]) if (o and o.get("iv")) else 0.0
@@ -1438,7 +1449,119 @@ def _position_risk(p: dict, chain_by_sym: dict, spot: float, prices: dict) -> di
             "vega$_1pct": 0.0, "betaDelta$": 0.0, "mv": p.get("mv"), "greeksSource": "unavailable"}
 
 
-async def _collect_positions(include_alpaca: bool, include_file: bool) -> tuple:
+# ---- Robinhood source (robin_stocks + cached session pickle) ----
+RH_ENV_DEFAULT = "/Users/jsconiers/Claude/MCP/robin-hood/.env"
+RH_PICKLE_DIR_DEFAULT = os.path.expanduser("~/.robinhood")
+RH_CACHE_TTL = 60.0
+_rh_logged_in = False
+_rh_cache = {"ts": 0.0, "data": None}
+
+
+def _occ_symbol(root: str, expiry: str, cp: str, strike) -> str:
+    yy, mm, dd = expiry[2:4], expiry[5:7], expiry[8:10]
+    return f"{root}{yy}{mm}{dd}{cp}{int(round(float(strike) * 1000)):08d}"
+
+
+def _rh_login_sync() -> None:
+    global _rh_logged_in
+    if _rh_logged_in:
+        return
+    try:
+        import robin_stocks.robinhood as rh
+        from dotenv import load_dotenv
+    except ImportError:
+        raise EdgeError("robin_stocks not installed in this environment.")
+    envf = os.environ.get("RH_ENV_FILE", RH_ENV_DEFAULT)
+    if os.path.exists(envf):
+        load_dotenv(envf)
+    u, p = os.environ.get("RH_USERNAME"), os.environ.get("RH_PASSWORD")
+    if not (u and p):
+        raise EdgeError("Robinhood credentials not found (set RH_USERNAME/RH_PASSWORD or RH_ENV_FILE).")
+    rh.login(u, p, store_session=True,
+             pickle_path=os.environ.get("RH_PICKLE_PATH", RH_PICKLE_DIR_DEFAULT),
+             pickle_name=os.environ.get("RH_PICKLE_NAME", ""), expiresIn=86400 * 7)
+    _rh_logged_in = True
+
+
+def _rh_collect_sync() -> list:
+    import time as _t
+    if _rh_cache["data"] is not None and (_t.time() - _rh_cache["ts"]) < RH_CACHE_TTL:
+        return _rh_cache["data"]
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    out = []
+    for sym, d in (rh.build_holdings() or {}).items():
+        q = _f(d.get("quantity")) or 0.0
+        if q == 0:
+            continue
+        px = _f(d.get("price")) or 0.0
+        out.append({"broker": "robinhood", "symbol": sym, "qty": q, "type": "equity",
+                    "underlying": sym, "price": px,
+                    "mv": (_f(d.get("equity")) if d.get("equity") else q * px), "beta": None})
+    try:
+        opos = rh.get_open_option_positions() or []
+    except Exception:  # noqa: BLE001
+        opos = []
+    for pos in opos:
+        try:
+            q = _f(pos.get("quantity")) or 0.0
+            if q == 0:
+                continue
+            qty = q if (pos.get("type") or "").lower() != "short" else -q
+            chain = pos.get("chain_symbol", "")
+            opt_url = pos.get("option", "")
+            od = {}
+            if opt_url:
+                try:
+                    od = rh.helper.request_get(opt_url) or {}
+                except Exception:  # noqa: BLE001
+                    od = {}
+            oid = od.get("id") or (opt_url.rstrip("/").split("/")[-1] if opt_url else None)
+            strike = _f(od.get("strike_price"))
+            expiry = od.get("expiration_date")
+            cp = {"call": "C", "put": "P"}.get(od.get("type"))
+            md = {}
+            if oid:
+                try:
+                    raw = rh.get_option_market_data_by_id(oid)
+                    md = raw[0] if isinstance(raw, list) and raw else (raw or {})
+                except Exception:  # noqa: BLE001
+                    md = {}
+            undpx = None
+            if chain:
+                try:
+                    lp = rh.get_latest_price(chain)
+                    undpx = _f(lp[0]) if lp else None
+                except Exception:  # noqa: BLE001
+                    undpx = None
+            mark = _f(md.get("mark_price")) or _f(md.get("adjusted_mark_price"))
+            occ = (_occ_symbol(chain, expiry, cp, strike)
+                   if (chain and expiry and cp and strike) else (opt_url or chain))
+            out.append({"broker": "robinhood", "symbol": occ, "qty": qty, "type": "option",
+                        "underlying": chain, "strike": strike, "expiry": expiry, "cp": cp,
+                        "price": undpx, "iv": _f(md.get("implied_volatility")),
+                        "delta": _f(md.get("delta")), "gamma": _f(md.get("gamma")),
+                        "theta": _f(md.get("theta")), "vega": _f(md.get("vega")),
+                        "mv": (mark * abs(qty) * 100 if mark else None)})
+        except Exception:  # noqa: BLE001
+            continue
+    _rh_cache["data"], _rh_cache["ts"] = out, _t.time()
+    return out
+
+
+async def _robinhood_positions() -> list:
+    import asyncio
+    return await asyncio.to_thread(_rh_collect_sync)
+
+
+async def _collect_positions(include_alpaca: bool, include_file: bool, include_robinhood: bool = True) -> tuple:
     positions, meta = [], {}
     if include_alpaca:
         try:
@@ -1447,6 +1570,15 @@ async def _collect_positions(include_alpaca: bool, include_file: bool) -> tuple:
             meta["alpaca"] = len(rows)
         except EdgeError as exc:
             meta["alpacaError"] = str(exc)
+    if include_robinhood:
+        try:
+            rhpos = await _robinhood_positions()
+            positions += rhpos
+            meta["robinhood"] = len(rhpos)
+        except EdgeError as exc:
+            meta["robinhoodError"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            meta["robinhoodError"] = f"{type(exc).__name__}: {str(exc)[:140]}"
     if include_file:
         try:
             fpos, path = _read_positions_file()
@@ -1474,8 +1606,8 @@ async def _price_map(positions: list, spot: float) -> dict:
     return {s: v for s, v in zip(need, vals)}
 
 
-async def _aggregate(include_alpaca: bool = True, include_file: bool = True) -> dict:
-    positions, meta = await _collect_positions(include_alpaca, include_file)
+async def _aggregate(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
+    positions, meta = await _collect_positions(include_alpaca, include_file, include_robinhood)
     chain, spot = None, 0.0
     has_spx = any(p["type"] == "option" and ((_parse_occ(p["symbol"]) or [""])[0] in ("SPX", "SPXW"))
                   for p in positions)
@@ -1505,6 +1637,16 @@ async def risk_status() -> dict:
         except EdgeError as exc:
             out["alpaca"]["reachable"] = False
             out["alpaca"]["error"] = str(exc)
+    rh_env = os.environ.get("RH_ENV_FILE", RH_ENV_DEFAULT)
+    rh_pickle = os.path.join(os.environ.get("RH_PICKLE_PATH", RH_PICKLE_DIR_DEFAULT),
+                             f"robinhood{os.environ.get('RH_PICKLE_NAME', '')}.pickle")
+    try:
+        import robin_stocks  # noqa: F401
+        rh_lib = True
+    except ImportError:
+        rh_lib = False
+    out["robinhood"] = {"libInstalled": rh_lib, "envExists": os.path.exists(rh_env),
+                        "sessionPickleExists": os.path.exists(rh_pickle), "loggedIn": _rh_logged_in}
     _, fpath = _read_positions_file()
     out["positionsFile"] = {"path": fpath, "exists": os.path.exists(fpath)}
     return out
@@ -1519,6 +1661,25 @@ async def alpaca_positions() -> dict:
         return {"error": str(exc)}
     norm = _normalize_alpaca(rows)
     return {"mode": "paper" if _alpaca_creds()[2] else "live", "count": len(norm), "positions": norm}
+
+
+@mcp.tool()
+async def robinhood_positions() -> dict:
+    """Live Robinhood holdings (stocks + options) via the cached robin_stocks session.
+
+    Stocks come from build_holdings; option legs include broker-provided Greeks (delta/gamma/theta/vega)
+    and IV. Auth reuses the ~/.robinhood session pickle (shared with the robinhood-local server); if it
+    has expired you'll get a one-time device-approval prompt in the Robinhood app on first use.
+    """
+    try:
+        pos = await _robinhood_positions()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    stocks = [x for x in pos if x["type"] == "equity"]
+    opts = [x for x in pos if x["type"] == "option"]
+    return {"count": len(pos), "stocks": len(stocks), "options": len(opts), "positions": pos}
 
 
 @mcp.tool()
@@ -1552,14 +1713,14 @@ def _exposure(r: dict) -> float:
 
 
 @mcp.tool()
-async def net_greeks(include_alpaca: bool = True, include_file: bool = True) -> dict:
+async def net_greeks(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
     """Net portfolio Greeks aggregated across Alpaca and the positions file.
 
     Sums dollar delta, dollar gamma (per 1% move), theta (per day), and vega (per 1% vol). SPX/SPXW
     options get full Black-Scholes Greeks off CBOE; equities contribute delta only (beta-weighted);
     other instruments use whatever the positions file provides. Delta is also expressed in SPX points.
     """
-    agg = await _aggregate(include_alpaca, include_file)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -1587,12 +1748,12 @@ async def net_greeks(include_alpaca: bool = True, include_file: bool = True) -> 
 
 
 @mcp.tool()
-async def risk_summary(include_alpaca: bool = True, include_file: bool = True) -> dict:
+async def risk_summary(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
     """Portfolio risk overview: beta-weighted SPX exposure, gross/long/short notional, and breakdowns.
 
     Groups exposure by broker and by underlying, and lists the largest directional contributors.
     """
-    agg = await _aggregate(include_alpaca, include_file)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -1624,12 +1785,12 @@ async def risk_summary(include_alpaca: bool = True, include_file: bool = True) -
 
 
 @mcp.tool()
-async def concentration(include_alpaca: bool = True, include_file: bool = True) -> dict:
+async def concentration(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
     """Exposure concentration by underlying, flagging any name above the concentration threshold.
 
     Threshold defaults to 25% of gross exposure (override with CONCENTRATION_PCT).
     """
-    agg = await _aggregate(include_alpaca, include_file)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
     risks = agg["positions"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -1650,7 +1811,7 @@ async def concentration(include_alpaca: bool = True, include_file: bool = True) 
 @mcp.tool()
 async def scenario_shock(
     moves_pct: Optional[str] = None,
-    include_alpaca: bool = True, include_file: bool = True,
+    include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True,
 ) -> dict:
     """Estimate portfolio P&L under a set of SPX % moves using net beta-delta + net gamma convexity.
 
@@ -1658,7 +1819,7 @@ async def scenario_shock(
     positions use delta + gamma; everything else is beta-weighted linear. A quick risk read, not a
     full revaluation.
     """
-    agg = await _aggregate(include_alpaca, include_file)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}

@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.3.0] - 2026-06-19
+
+### Added
+- **Robinhood as a live aggregator source.** The risk/Greeks aggregator now auto-pulls Robinhood stock
+  holdings (`build_holdings`) and option legs — with broker-provided delta/gamma/theta/vega/IV — via the
+  cached `robin_stocks` session, alongside Alpaca. New `robinhood_positions` tool (32 tools total). Each
+  source is toggleable per call (`include_alpaca` / `include_robinhood` / `include_file`).
+- `_position_risk` now uses broker-supplied option Greeks when present (`greeksSource: "broker"`).
+
+### Notes
+- Requires `robin_stocks`; the session pickle (`~/.robinhood/`) is shared with the robinhood-local
+  server and refreshes every 7 days (device-approval prompt on first use after expiry).
+
 ## [0.2.0] - 2026-06-19
 
 Expanded from a Tier-1 options cockpit into a full trading-context server (31 tools).
