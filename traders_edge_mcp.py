@@ -1597,7 +1597,10 @@ def _rh_collect_sync() -> list:
                         "price": undpx, "iv": _f(md.get("implied_volatility")),
                         "delta": _f(md.get("delta")), "gamma": _f(md.get("gamma")),
                         "theta": _f(md.get("theta")), "vega": _f(md.get("vega")),
-                        "mv": (mark * abs(qty) * 100 if mark else None)})
+                        "mv": (mark * abs(qty) * 100 if mark else None),
+                        "avgPrice": _f(pos.get("average_price")),
+                        "mult": _f(pos.get("trade_value_multiplier")) or 100.0,
+                        "mark": mark})
         except Exception:  # noqa: BLE001
             continue
     _rh_cache["data"], _rh_cache["ts"] = out, _t.time()
@@ -2615,6 +2618,298 @@ async def daily_game_plan(root: str = "SPXW") -> dict:
     if note:
         out["note"] = note
     return out
+
+
+# ============================================================================
+# COVERED-CALL MANAGER + SINGLE-NAME EARNINGS CALENDAR + REGIME CLASSIFIER
+# ============================================================================
+_ETF_HINTS = {"SCHD", "TOPT", "VOO", "CHPY", "SPY", "QQQ", "IVV", "DIA", "IWM", "VTI"}
+
+
+def _dte_days(expiry: Optional[str]) -> Optional[int]:
+    if not expiry:
+        return None
+    try:
+        return (_dt.date.fromisoformat(expiry[:10]) - _today_et()).days
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _next_earnings_sync(symbol: str) -> Optional[dict]:
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    try:
+        e = rh.stocks.get_earnings(symbol) or []
+    except Exception:  # noqa: BLE001
+        return None
+    today = _today_et()
+    best = None
+    for x in e:
+        rep = x.get("report") or {}
+        ds = rep.get("date")
+        if not ds:
+            continue
+        try:
+            d = _dt.date.fromisoformat(ds[:10])
+        except Exception:  # noqa: BLE001
+            continue
+        if d < today:
+            continue
+        if best is None or d < best[0]:
+            best = (d, rep.get("timing"), rep.get("verified"), x.get("year"), x.get("quarter"))
+    if best is None:
+        return None
+    d, timing, verified, yr, q = best
+    tmap = {"am": "before open (BMO)", "pm": "after close (AMC)"}
+    return {"date": d.isoformat(), "daysAway": (d - today).days,
+            "session": tmap.get(timing, timing or "unknown"), "confirmed": bool(verified),
+            "fiscal": (f"Q{q} {yr}" if q and yr else None)}
+
+
+async def _next_earnings(symbol: str) -> Optional[dict]:
+    import asyncio
+    return await asyncio.to_thread(_next_earnings_sync, symbol)
+
+
+@mcp.tool()
+async def covered_call_manager(
+    roll_delta: Annotated[float, Field(ge=0.1, le=0.9)] = 0.45,
+    roll_dte: Annotated[int, Field(ge=0, le=60)] = 7,
+) -> dict:
+    """Manage your short (covered) calls: DTE, assignment probability (delta), premium captured vs
+    extrinsic left, annualized yield, share-coverage check, earnings-before-expiry risk, and roll signals.
+
+    Scans Robinhood option positions for short calls and matches them to your share holdings to confirm
+    coverage. A roll is flagged when the call is ITM into expiry (DTE <= `roll_dte`), delta is deep, or
+    most of the premium has already decayed. Assignment probability is approximated by the option delta.
+    """
+    import asyncio
+    try:
+        pos = await _robinhood_positions()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    shares: dict = {}
+    for p in pos:
+        if p.get("type") == "equity":
+            shares[p["symbol"]] = shares.get(p["symbol"], 0.0) + (p.get("qty") or 0.0)
+    shorts = [p for p in pos if p.get("type") == "option" and p.get("cp") == "C"
+              and (p.get("qty") or 0) < 0]
+    if not shorts:
+        return {"note": "No short call positions found on Robinhood.",
+                "equityHoldings": sorted(shares.keys())}
+    unders = sorted({p["underlying"] for p in shorts if p.get("underlying")})
+    earn_list = await asyncio.gather(*[_next_earnings(u) for u in unders])
+    earn = dict(zip(unders, earn_list))
+    rows, tot_prem = [], 0.0
+    for p in shorts:
+        u = p.get("underlying")
+        contracts = abs(p.get("qty") or 0.0)
+        strike = p.get("strike")
+        undpx = p.get("price")
+        delta = p.get("delta")
+        avg = p.get("avgPrice")
+        mult = p.get("mult") or 100.0
+        mark = p.get("mark")
+        dte = _dte_days(p.get("expiry"))
+        prem_total = (avg * contracts * mult) if (avg is not None) else None
+        if prem_total:
+            tot_prem += prem_total
+        intrinsic = (max(0.0, undpx - strike) if (undpx is not None and strike is not None) else None)
+        extrinsic = (max(0.0, mark - intrinsic) if (mark is not None and intrinsic is not None) else None)
+        assign_prob = (abs(delta) * 100.0) if delta is not None else None
+        is_itm = (undpx is not None and strike is not None and undpx > strike)
+        covered = shares.get(u, 0.0) >= 100.0 * contracts
+        ann_yield = ((avg / undpx) * (365.0 / dte) * 100.0
+                     if (avg is not None and undpx and dte and dte > 0) else None)
+        # management / roll signal (priority order)
+        if is_itm and dte is not None and dte <= roll_dte:
+            sig = "ITM into expiry - roll up/out to defend shares, or accept assignment"
+        elif delta is not None and abs(delta) >= 0.70:
+            sig = "deep ITM (high assignment prob) - roll out/up if keeping shares"
+        elif avg and mark is not None and mark <= 0.20 * avg and (dte is None or dte > roll_dte):
+            sig = "most premium captured - consider buy-to-close to free shares / re-strike"
+        elif dte is not None and dte <= roll_dte and assign_prob is not None and assign_prob < 30:
+            sig = "low assignment risk near expiry - let expire, then re-write"
+        elif delta is not None and abs(delta) >= roll_delta and dte is not None and dte <= max(roll_dte * 2, 14):
+            sig = "approaching roll zone - watch delta/DTE"
+        else:
+            sig = "hold; manage at thresholds"
+        e = earn.get(u)
+        earn_flag = None
+        if e and p.get("expiry"):
+            try:
+                ed = _dt.date.fromisoformat(e["date"])
+                if _today_et() <= ed <= _dt.date.fromisoformat(p["expiry"][:10]):
+                    earn_flag = f"earnings {e['date']} ({e['session']}) BEFORE expiry - gap/assignment risk"
+            except Exception:  # noqa: BLE001
+                pass
+        rows.append({
+            "underlying": u, "contracts": int(contracts), "strike": strike, "expiry": p.get("expiry"),
+            "dte": dte, "underlyingPx": round(undpx, 2) if undpx else None,
+            "moneyness": "ITM" if is_itm else "OTM",
+            "assignmentProb%": round(assign_prob, 1) if assign_prob is not None else None,
+            "delta": round(delta, 3) if delta is not None else None,
+            "premiumCaptured$": round(prem_total, 2) if prem_total is not None else None,
+            "mark$/sh": round(mark, 2) if mark is not None else None,
+            "extrinsicLeft$/sh": round(extrinsic, 2) if extrinsic is not None else None,
+            "annYieldOnPremium%": round(ann_yield, 1) if ann_yield is not None else None,
+            "covered": covered, "sharesHeld": int(shares.get(u, 0.0)),
+            "signal": sig, "earningsRisk": earn_flag,
+        })
+    rows.sort(key=lambda r: (r["dte"] if r["dte"] is not None else 9999))
+    return {"shortCalls": len(shorts), "totalPremiumCaptured$": round(tot_prem, 2),
+            "rollThresholds": {"delta": roll_delta, "dte": roll_dte}, "positions": rows}
+
+
+@mcp.tool()
+async def earnings_calendar(symbols: Optional[str] = None,
+                            days: Annotated[int, Field(ge=1, le=400)] = 90) -> dict:
+    """Next single-name earnings dates for your holdings (or a provided symbol list), sorted by
+    proximity, with the report session (BMO/AMC), days away, and whether it falls within `days`.
+
+    Earnings are binary-risk events; this flags which positions report soon. Holdings with no earnings
+    (ETFs/funds) are listed separately. Dates come from Robinhood's earnings data (the upcoming report
+    is the entry with no actual EPS yet).
+    """
+    import asyncio
+    if symbols:
+        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        try:
+            pos = await _robinhood_positions()
+        except EdgeError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        syms = sorted({p["symbol"] for p in pos if p.get("type") == "equity"})
+    if not syms:
+        return {"note": "No equity symbols to check."}
+    res = await asyncio.gather(*[_next_earnings(s) for s in syms])
+    upcoming, none_found = [], []
+    today = _today_et()
+    for s, e in zip(syms, res):
+        if e is None:
+            none_found.append(s)
+        else:
+            upcoming.append({"symbol": s, **e, "withinWindow": e["daysAway"] <= days})
+    upcoming.sort(key=lambda r: r["daysAway"])
+    within = [r for r in upcoming if r["withinWindow"]]
+    return {"windowDays": days, "asof": today.isoformat(),
+            "withinWindowCount": len(within), "nextEarnings": upcoming,
+            "noEarnings_ETFsFunds": none_found}
+
+
+def _score_band(value: float, bands: list) -> tuple:
+    """bands: ascending [(upper_threshold, score, label), ...]; first whose threshold >= value wins."""
+    for thr, sc, lab in bands:
+        if value <= thr:
+            return sc, lab
+    return bands[-1][1], bands[-1][2]
+
+
+@mcp.tool()
+async def regime_classifier() -> dict:
+    """One-call market-regime read for 0DTE posture: folds VIX level + VIX term structure + financial
+    conditions (NFCI) + credit spreads (HY OAS) + the yield curve + the Sahm rule into a single
+    risk-on / constructive / neutral / caution / risk-off score with a suggested trading posture.
+
+    Combines your existing siloed CBOE/FRED gauges into one verdict. VIX & term structure are ~15-min
+    delayed; the FRED series update daily/weekly.
+    """
+    import asyncio
+    vix, v9, v3m = await asyncio.gather(_vol_index("VIX"), _vol_index("VIX9D"), _vol_index("VIX3M"))
+    nfci, hy, c2s10, sahm = await asyncio.gather(
+        asyncio.to_thread(_latest_obs, "NFCI"),
+        asyncio.to_thread(_latest_obs, "BAMLH0A0HYM2"),
+        asyncio.to_thread(_latest_obs, "T10Y2Y"),
+        asyncio.to_thread(_latest_obs, "SAHMREALTIME"),
+    )
+    factors, score, n = [], 0, 0
+
+    def add(name, val, sc, lab):
+        nonlocal score, n
+        if sc is not None:
+            score += sc
+            n += 1
+        factors.append({"factor": name, "value": val, "score": sc, "read": lab})
+
+    if vix is not None:
+        sc, lab = _score_band(vix, [(13, 1, "calm"), (20, 0, "normal"), (30, -1, "elevated"),
+                                    (1e9, -2, "stress")])
+        add("VIX", round(vix, 2), sc, lab)
+    else:
+        add("VIX", None, None, "unavailable")
+
+    if v9 and v3m and v3m > 0:
+        ratio = v9 / v3m
+        if ratio <= 0.95:
+            sc, lab = 1, "steep contango (calm)"
+        elif ratio <= 1.0:
+            sc, lab = 0, "contango"
+        elif ratio <= 1.05:
+            sc, lab = -1, "mild backwardation (stress)"
+        else:
+            sc, lab = -2, "deep backwardation (acute stress)"
+        add("VIX term 9D/3M", round(ratio, 3), sc, lab)
+    else:
+        add("VIX term 9D/3M", None, None, "unavailable")
+
+    if nfci is not None:
+        sc, lab = _score_band(nfci[1], [(-0.2, 1, "loose"), (0.2, 0, "neutral"), (0.5, -1, "tight"),
+                                        (1e9, -2, "very tight")])
+        add("NFCI (financial conditions)", round(nfci[1], 3), sc, lab)
+    else:
+        add("NFCI (financial conditions)", None, None, "unavailable")
+
+    if hy is not None:
+        sc, lab = _score_band(hy[1], [(3.5, 1, "tight credit"), (5.0, 0, "normal credit"),
+                                      (7.0, -1, "wide credit"), (1e9, -2, "stressed credit")])
+        add("HY OAS %", round(hy[1], 2), sc, lab)
+    else:
+        add("HY OAS %", None, None, "unavailable")
+
+    if c2s10 is not None:
+        if c2s10[1] < 0:
+            sc, lab = -1, "inverted (late-cycle caution)"
+        else:
+            sc, lab = 0, "positive slope"
+        add("2s10s curve %", round(c2s10[1], 2), sc, lab)
+    else:
+        add("2s10s curve %", None, None, "unavailable")
+
+    if sahm is not None:
+        if sahm[1] < 0.3:
+            sc, lab = 0, "no recession signal"
+        elif sahm[1] < 0.5:
+            sc, lab = -1, "warming (watch)"
+        else:
+            sc, lab = -2, "recession trigger (>=0.5)"
+        add("Sahm rule", round(sahm[1], 2), sc, lab)
+    else:
+        add("Sahm rule", None, None, "unavailable")
+
+    if score >= 3:
+        regime = "RISK-ON"
+    elif score >= 1:
+        regime = "CONSTRUCTIVE"
+    elif score >= -1:
+        regime = "NEUTRAL"
+    elif score >= -3:
+        regime = "CAUTION"
+    else:
+        regime = "RISK-OFF / STRESS"
+    posture = {
+        "RISK-ON": "Calm/long-gamma backdrop: pinning & mean-reversion favored; fading extremes and premium-selling work; normal size.",
+        "CONSTRUCTIVE": "Mostly calm: lean range/mean-revert but keep stops; normal-to-slightly-reduced size.",
+        "NEUTRAL": "Mixed signals: trade levels both ways, no strong edge; standard risk.",
+        "CAUTION": "Stress building (vol/credit): expect trend and gamma flips; cut size, respect levels, avoid fading strength/weakness.",
+        "RISK-OFF / STRESS": "Acute stress: large ranges, negative gamma; trade small or stand aside, no counter-trend fades.",
+    }[regime]
+    return {"asof": "CBOE ~15-min + FRED daily", "regime": regime, "compositeScore": score,
+            "factorsScored": n, "avgFactor": round(score / n, 2) if n else 0.0,
+            "posture": posture, "factors": factors}
 
 
 def main() -> None:

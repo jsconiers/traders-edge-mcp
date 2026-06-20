@@ -3,6 +3,23 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.6.0] - 2026-06-20
+
+### Added
+- **`covered_call_manager`** - scans Robinhood short-call positions: DTE, assignment probability
+  (delta), premium captured vs extrinsic remaining, annualized yield, share-coverage check,
+  earnings-before-expiry risk flag, and roll/management signals (params: `roll_delta`, `roll_dte`).
+- **`earnings_calendar`** - next single-name earnings dates for your holdings (or a symbol list),
+  sorted by proximity, with BMO/AMC session, days away, and within-window flag; ETFs/funds listed
+  separately. Sourced from Robinhood earnings data (no extra API key).
+- **`regime_classifier`** - one composite risk-on/constructive/neutral/caution/risk-off read folding
+  VIX level + VIX term structure + NFCI + HY OAS + 2s10s curve + Sahm rule, with a 0DTE posture.
+  42 tools total.
+
+### Changed
+- Robinhood option-position normalizer now also carries `avgPrice`, `mult`, and `mark` (enables the
+  covered-call premium/extrinsic math).
+
 ## [0.5.0] - 2026-06-19
 
 ### Added

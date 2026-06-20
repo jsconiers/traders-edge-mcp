@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (39)
+## Tools (42)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -119,6 +119,13 @@ Example positions file:
 Realized P&L is reconstructed from Robinhood option fills (`net_amount`, fees included) with round trips
 matched open->close FIFO. These tools target the logged pattern of giving back gains after hitting target;
 a recon note flags any day where positions expired or remain open (net cash flow != round-trip realized).
+
+### Position management & macro regime
+| Tool | What it does |
+|------|--------------|
+| `covered_call_manager` | Scans your Robinhood short calls: DTE, assignment prob (delta), premium captured vs extrinsic left, annualized yield, share-coverage check, earnings-before-expiry flag, and roll signals. |
+| `earnings_calendar` | Next single-name earnings for your holdings (or a symbol list): date, BMO/AMC session, days away, within-window flag; ETFs/funds listed separately. |
+| `regime_classifier` | Folds VIX + VIX term structure + NFCI + HY credit spreads + 2s10s curve + Sahm rule into one risk-on/neutral/risk-off score with a 0DTE posture. |
 
 ## Data sources (no API key required)
 
