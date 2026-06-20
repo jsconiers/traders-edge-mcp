@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (32)
+## Tools (33)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -69,11 +69,12 @@ Macro data is pulled key-less from the FRED fredgraph CSV endpoint.
 | `scenario_shock` | Portfolio P&L across a set of SPX % moves (delta + gamma convexity). |
 | `daily_target` | Today's realized P&L vs your daily target (`DAILY_TARGET`, default $524), with a post-target discipline check. |
 | `robinhood_positions` | Live Robinhood holdings (stocks + option legs with broker-provided Greeks). |
+| `etrade_positions` | Live E\*TRADE holdings (stocks + options; SPX/SPXW priced via CBOE). |
 | `alpaca_positions` / `load_positions` | Raw position views from each source. |
 | `risk_status` | Which position sources are configured / reachable. |
 
-Positions are pulled **automatically** from your **Alpaca** and **Robinhood** accounts, and can be
-supplemented with a broker-agnostic **positions file** for anything held elsewhere (E\*TRADE, etc.):
+Positions are pulled **automatically** from your **Alpaca**, **Robinhood**, and **E\*TRADE** accounts,
+and can be supplemented with a broker-agnostic **positions file** for anything held elsewhere:
 
 - **Alpaca** — live `/v2/positions` (creds via `ALPACA_ENV_FILE`, default the alpaca-mcp `.env`).
 - **Robinhood** — stock holdings plus option legs (with broker-provided delta/gamma/theta/vega/IV) via
@@ -81,11 +82,18 @@ supplemented with a broker-agnostic **positions file** for anything held elsewhe
   `RH_PASSWORD` (or `RH_ENV_FILE`, default the robinhood-local `.env`); the session pickle lives in
   `~/.robinhood/` and refreshes every 7 days (a one-time device-approval prompt may appear in the
   Robinhood app on first use after expiry).
+- **E\*TRADE** — stock + option positions via the cached `pyetrade` OAuth session shared with the etrade
+  MCP (`~/.etrade/tokens.pickle`; idle tokens auto-renew). Creds from `ETRADE_CONSUMER_KEY`/`SECRET`
+  (or `ET_ENV_FILE`). E\*TRADE access tokens expire nightly — if expired, re-authorize via the etrade
+  MCP (`setup_etrade_auth.py`). SPX/SPXW E\*TRADE options are priced from CBOE; equity-option Greeks
+  from E\*TRADE aren't fetched yet.
 - **Positions file** — default `~/.trading/positions.json` (override `POSITIONS_FILE`).
 
-Each source can be toggled per call via `include_alpaca` / `include_robinhood` / `include_file`.
-SPX/SPXW options are auto-priced from CBOE; broker-supplied option Greeks are used directly; equities
-are beta-weighted. Example positions file:
+Each source can be toggled per call via `include_alpaca` / `include_robinhood` / `include_etrade` /
+`include_file`. SPX/SPXW options are auto-priced from CBOE; broker-supplied option Greeks are used
+directly; equities are **beta-weighted** for SPX-equivalent exposure via a built-in beta map (editable
+with `BETA_OVERRIDES="ICE:1.05,NVDA:1.7"` or `BETA_MAP_FILE=<json>`; unmapped symbols default to 1.0).
+Example positions file:
 
 ```json
 {"positions": [

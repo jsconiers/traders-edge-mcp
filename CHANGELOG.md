@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.4.0] - 2026-06-19
+
+### Added
+- **E\*TRADE as a live aggregator source.** Auto-pulls E\*TRADE stock + option positions via the cached
+  `pyetrade` OAuth session shared with the etrade MCP. New `etrade_positions` tool (33 tools total);
+  toggle with `include_etrade`.
+- **Editable beta map for SPX-weighting.** Auto-pulled equities are now beta-weighted using a built-in
+  map (ICE, NVDA, SCHD, VOO, ...), overridable via `BETA_OVERRIDES` or `BETA_MAP_FILE`. `net_greeks` /
+  `risk_summary` now report a meaningful `netDelta_betaWeighted$` distinct from raw delta.
+
+### Notes
+- Requires `pyetrade`. E\*TRADE access tokens expire nightly; re-authorize via the etrade MCP if the
+  cached token is stale. E\*TRADE equity-option Greeks aren't fetched yet (SPX/SPXW priced via CBOE).
+
 ## [0.3.0] - 2026-06-19
 
 ### Added

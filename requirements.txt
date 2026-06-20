@@ -2,3 +2,4 @@ fastmcp>=3.4.0
 httpx>=0.28.0
 numpy>=2.0.0
 robin_stocks>=3.4.0  # optional: enables the Robinhood aggregator source
+pyetrade>=2.1.1  # optional: enables the E*TRADE aggregator source

@@ -1383,12 +1383,60 @@ def _read_positions_file() -> tuple:
     return out, path
 
 
+# ---- Beta map for SPX-weighting auto-pulled equities ----
+# Editable ~5yr betas; override via BETA_OVERRIDES="ICE:1.05,NVDA:1.7" or BETA_MAP_FILE=<json path>.
+_BETA_DEFAULTS = {
+    "VOO": 1.00, "SPY": 1.00, "IVV": 1.00, "QQQ": 1.15,
+    "ICE": 1.00, "AAPL": 1.20, "MSFT": 1.10, "NVDA": 1.65,
+    "SCHD": 0.82, "TOPT": 1.10, "EPR": 1.35, "LTC": 0.85, "CHPY": 0.65,
+}
+_BETA_OVERRIDES = None
+
+
+def _load_beta_overrides() -> dict:
+    ov = {}
+    for part in os.environ.get("BETA_OVERRIDES", "").split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            try:
+                ov[k.strip().upper()] = float(v)
+            except ValueError:
+                pass
+    f = os.environ.get("BETA_MAP_FILE")
+    if f and os.path.exists(f):
+        import json as _j
+        try:
+            for k, v in (_j.load(open(f)) or {}).items():
+                ov[str(k).strip().upper()] = float(v)
+        except Exception:  # noqa: BLE001
+            pass
+    return ov
+
+
+def _beta_for(symbol: str) -> float:
+    global _BETA_OVERRIDES
+    if _BETA_OVERRIDES is None:
+        _BETA_OVERRIDES = _load_beta_overrides()
+    s = (symbol or "").upper()
+    return _BETA_OVERRIDES.get(s, _BETA_DEFAULTS.get(s, 1.0))
+
+
+def _beta_of(p: dict) -> float:
+    b = p.get("beta")
+    if b is not None:
+        try:
+            return float(b)
+        except (ValueError, TypeError):
+            pass
+    return _beta_for(p.get("underlying") or "")
+
+
 def _position_risk(p: dict, chain_by_sym: dict, spot: float, prices: dict) -> dict:
     typ = p["type"]
     qty = p["qty"]
     if typ == "equity":
         px = p.get("price") or prices.get(p["underlying"]) or 0.0
-        beta = float(p.get("beta") or 1.0)
+        beta = _beta_of(p)
         dd = qty * px
         return {"broker": p["broker"], "symbol": p["symbol"], "underlying": p["underlying"],
                 "type": "equity", "qty": qty, "price": round(px, 2), "beta": beta,
@@ -1406,7 +1454,7 @@ def _position_risk(p: dict, chain_by_sym: dict, spot: float, prices: dict) -> di
         undpx = float(p.get("price") or prices.get(p.get("underlying") or root) or 0.0)
         d = float(p["delta"]); gg = float(p.get("gamma") or 0.0)
         th = float(p.get("theta") or 0.0); vg = float(p.get("vega") or 0.0)
-        beta = float(p.get("beta") or 1.0)
+        beta = _beta_of(p)
         dd = d * qty * mult * undpx
         return {"broker": p["broker"], "symbol": p["symbol"], "underlying": (p.get("underlying") or root),
                 "type": "option", "qty": qty, "strike": strike, "expiry": expiry, "delta$": dd,
@@ -1427,7 +1475,7 @@ def _position_risk(p: dict, chain_by_sym: dict, spot: float, prices: dict) -> di
                     "betaDelta$": dd, "mv": p.get("mv"), "greeksSource": "CBOE"}
     undpx = p.get("price") or prices.get(p.get("underlying") or root) or 0.0
     iv = p.get("iv")
-    beta = float(p.get("beta") or 1.0)
+    beta = _beta_of(p)
     if iv and undpx and strike and expiry and cp:
         T = _year_frac(expiry)
         d, g, th, vg = _greeks_risk(float(undpx), float(strike), T, float(iv), cpC)
@@ -1561,7 +1609,115 @@ async def _robinhood_positions() -> list:
     return await asyncio.to_thread(_rh_collect_sync)
 
 
-async def _collect_positions(include_alpaca: bool, include_file: bool, include_robinhood: bool = True) -> tuple:
+# ---- E*TRADE source (pyetrade + cached OAuth token pickle) ----
+ET_ENV_DEFAULT = "/Users/jsconiers/Claude/MCP/Etrade-MCP/.env"
+ET_TOKEN_FILE_DEFAULT = os.path.expanduser("~/.etrade/tokens.pickle")
+ET_CACHE_TTL = 60.0
+_et_cache = {"ts": 0.0, "data": None}
+
+
+def _to_float(v):
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _et_dig(d, *keys, default=None):
+    for k in keys:
+        if not isinstance(d, dict):
+            return default
+        d = d.get(k)
+        if d is None:
+            return default
+    return d
+
+
+def _etrade_clients():
+    import pickle
+    import pyetrade
+    from dotenv import load_dotenv
+    envf = os.environ.get("ET_ENV_FILE", ET_ENV_DEFAULT)
+    if os.path.exists(envf):
+        load_dotenv(envf)
+    ck = os.environ.get("ETRADE_CONSUMER_KEY", "")
+    cs = os.environ.get("ETRADE_CONSUMER_SECRET", "")
+    if not (ck and cs):
+        raise EdgeError("E*TRADE consumer key/secret not found (ETRADE_CONSUMER_KEY/SECRET or ET_ENV_FILE).")
+    tf = os.environ.get("ET_TOKEN_FILE", ET_TOKEN_FILE_DEFAULT)
+    if not os.path.exists(tf):
+        raise EdgeError("E*TRADE token not found; authorize via the etrade MCP (setup_etrade_auth.py).")
+    tk = pickle.load(open(tf, "rb"))
+    ot, osec = tk.get("oauth_token", ""), tk.get("oauth_token_secret", "")
+    dev = os.environ.get("ETRADE_SANDBOX", "false").lower() == "true"
+    return (pyetrade.ETradeAccounts(ck, cs, ot, osec, dev=dev),
+            pyetrade.ETradeAccessManager(ck, cs, ot, osec))
+
+
+def _etrade_collect_sync() -> list:
+    import time as _t
+    if _et_cache["data"] is not None and (_t.time() - _et_cache["ts"]) < ET_CACHE_TTL:
+        return _et_cache["data"]
+    accounts, access = _etrade_clients()
+    try:
+        access.renew_access_token()  # reactivate an idle (not expired) token; harmless if already active
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        a = accounts.list_accounts(resp_format="json")
+    except Exception as exc:  # noqa: BLE001
+        raise EdgeError(f"E*TRADE session not usable ({type(exc).__name__}); re-authorize via the etrade MCP.")
+    al = _et_dig(a, "AccountListResponse", "Accounts", "Account", default=[])
+    if isinstance(al, dict):
+        al = [al]
+    out = []
+    for acct0 in al:
+        aidk = acct0.get("accountIdKey", "")
+        if not aidk:
+            continue
+        try:
+            port = accounts.get_account_portfolio(aidk, resp_format="json")
+        except Exception:  # noqa: BLE001 -- empty portfolio returns HTTP 204 / empty body
+            continue
+        aps = _et_dig(port, "PortfolioResponse", "AccountPortfolio", default=[])
+        if isinstance(aps, dict):
+            aps = [aps]
+        for ap in aps:
+            plist = _et_dig(ap, "Position", default=[])
+            if isinstance(plist, dict):
+                plist = [plist]
+            for pos in plist:
+                prod = _et_dig(pos, "Product", default={}) or {}
+                quick = _et_dig(pos, "Quick", default={}) or {}
+                sym = prod.get("symbol", "")
+                qty = _to_float(pos.get("quantity")) or 0.0
+                if qty == 0:
+                    continue
+                mv = _to_float(pos.get("marketValue"))
+                if prod.get("securityType") == "OPTN":
+                    strike = _to_float(prod.get("strikePrice"))
+                    cp = {"CALL": "C", "PUT": "P"}.get((prod.get("callPut") or "").upper())
+                    ey, em, ed = prod.get("expiryYear"), prod.get("expiryMonth"), prod.get("expiryDay")
+                    expiry = (f"{int(ey):04d}-{int(em):02d}-{int(ed):02d}" if (ey and em and ed) else None)
+                    occ = (_occ_symbol(sym, expiry, cp, strike)
+                           if (sym and expiry and cp and strike) else sym)
+                    out.append({"broker": "etrade", "symbol": occ, "qty": qty, "type": "option",
+                                "underlying": sym, "strike": strike, "expiry": expiry, "cp": cp,
+                                "mv": mv})
+                else:
+                    out.append({"broker": "etrade", "symbol": sym, "qty": qty, "type": "equity",
+                                "underlying": sym, "price": _to_float(quick.get("lastTrade")) or 0.0,
+                                "mv": mv, "beta": None})
+    _et_cache["data"], _et_cache["ts"] = out, _t.time()
+    return out
+
+
+async def _etrade_positions() -> list:
+    import asyncio
+    return await asyncio.to_thread(_etrade_collect_sync)
+
+
+async def _collect_positions(include_alpaca: bool, include_file: bool, include_robinhood: bool = True, include_etrade: bool = True) -> tuple:
     positions, meta = [], {}
     if include_alpaca:
         try:
@@ -1579,6 +1735,15 @@ async def _collect_positions(include_alpaca: bool, include_file: bool, include_r
             meta["robinhoodError"] = str(exc)
         except Exception as exc:  # noqa: BLE001
             meta["robinhoodError"] = f"{type(exc).__name__}: {str(exc)[:140]}"
+    if include_etrade:
+        try:
+            etpos = await _etrade_positions()
+            positions += etpos
+            meta["etrade"] = len(etpos)
+        except EdgeError as exc:
+            meta["etradeError"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            meta["etradeError"] = f"{type(exc).__name__}: {str(exc)[:140]}"
     if include_file:
         try:
             fpos, path = _read_positions_file()
@@ -1606,8 +1771,8 @@ async def _price_map(positions: list, spot: float) -> dict:
     return {s: v for s, v in zip(need, vals)}
 
 
-async def _aggregate(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
-    positions, meta = await _collect_positions(include_alpaca, include_file, include_robinhood)
+async def _aggregate(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
+    positions, meta = await _collect_positions(include_alpaca, include_file, include_robinhood, include_etrade)
     chain, spot = None, 0.0
     has_spx = any(p["type"] == "option" and ((_parse_occ(p["symbol"]) or [""])[0] in ("SPX", "SPXW"))
                   for p in positions)
@@ -1647,6 +1812,15 @@ async def risk_status() -> dict:
         rh_lib = False
     out["robinhood"] = {"libInstalled": rh_lib, "envExists": os.path.exists(rh_env),
                         "sessionPickleExists": os.path.exists(rh_pickle), "loggedIn": _rh_logged_in}
+    et_env = os.environ.get("ET_ENV_FILE", ET_ENV_DEFAULT)
+    et_tok = os.environ.get("ET_TOKEN_FILE", ET_TOKEN_FILE_DEFAULT)
+    try:
+        import pyetrade  # noqa: F401
+        et_lib = True
+    except ImportError:
+        et_lib = False
+    out["etrade"] = {"libInstalled": et_lib, "envExists": os.path.exists(et_env),
+                     "tokenPickleExists": os.path.exists(et_tok)}
     _, fpath = _read_positions_file()
     out["positionsFile"] = {"path": fpath, "exists": os.path.exists(fpath)}
     return out
@@ -1661,6 +1835,25 @@ async def alpaca_positions() -> dict:
         return {"error": str(exc)}
     norm = _normalize_alpaca(rows)
     return {"mode": "paper" if _alpaca_creds()[2] else "live", "count": len(norm), "positions": norm}
+
+
+@mcp.tool()
+async def etrade_positions() -> dict:
+    """Live E*TRADE holdings (stocks + options) via the cached pyetrade OAuth session.
+
+    Reuses the ~/.etrade/tokens.pickle session shared with the etrade MCP (auto-renews an idle token).
+    Equities get current price + market value; SPX/SPXW option legs are priced from CBOE. If the daily
+    E*TRADE token has expired, re-authorize via the etrade MCP (setup_etrade_auth.py).
+    """
+    try:
+        pos = await _etrade_positions()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    stocks = [x for x in pos if x["type"] == "equity"]
+    opts = [x for x in pos if x["type"] == "option"]
+    return {"count": len(pos), "stocks": len(stocks), "options": len(opts), "positions": pos}
 
 
 @mcp.tool()
@@ -1713,14 +1906,14 @@ def _exposure(r: dict) -> float:
 
 
 @mcp.tool()
-async def net_greeks(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
+async def net_greeks(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
     """Net portfolio Greeks aggregated across Alpaca and the positions file.
 
     Sums dollar delta, dollar gamma (per 1% move), theta (per day), and vega (per 1% vol). SPX/SPXW
     options get full Black-Scholes Greeks off CBOE; equities contribute delta only (beta-weighted);
     other instruments use whatever the positions file provides. Delta is also expressed in SPX points.
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -1748,12 +1941,12 @@ async def net_greeks(include_alpaca: bool = True, include_file: bool = True, inc
 
 
 @mcp.tool()
-async def risk_summary(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
+async def risk_summary(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
     """Portfolio risk overview: beta-weighted SPX exposure, gross/long/short notional, and breakdowns.
 
     Groups exposure by broker and by underlying, and lists the largest directional contributors.
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -1785,12 +1978,12 @@ async def risk_summary(include_alpaca: bool = True, include_file: bool = True, i
 
 
 @mcp.tool()
-async def concentration(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True) -> dict:
+async def concentration(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
     """Exposure concentration by underlying, flagging any name above the concentration threshold.
 
     Threshold defaults to 25% of gross exposure (override with CONCENTRATION_PCT).
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
     risks = agg["positions"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -1811,7 +2004,7 @@ async def concentration(include_alpaca: bool = True, include_file: bool = True, 
 @mcp.tool()
 async def scenario_shock(
     moves_pct: Optional[str] = None,
-    include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True,
+    include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True,
 ) -> dict:
     """Estimate portfolio P&L under a set of SPX % moves using net beta-delta + net gamma convexity.
 
@@ -1819,7 +2012,7 @@ async def scenario_shock(
     positions use delta + gamma; everything else is beta-weighted linear. A quick risk read, not a
     full revaluation.
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
