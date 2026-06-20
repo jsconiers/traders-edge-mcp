@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "traders-edge": {
+      "command": "/Users/<you>/Claude/mcp/traders-edge-mcp/.venv/bin/python",
+      "args": ["/Users/<you>/Claude/mcp/traders-edge-mcp/traders_edge_mcp.py"]
+    }
+  }
+}
