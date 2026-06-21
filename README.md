@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (48)
+## Tools (62)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -147,6 +147,36 @@ elsewhere). Precedence is **env var > `config.json` > built-in default**, and ed
 key="daily_target", value="550")`. Editable keys: `daily_target`, `weekly_target`, `giveback_frac`,
 `rapid_reentry_secs`, `late_session_et`, `max_trades_per_day`, `roll_delta`, `roll_dte`. See
 `config.example.json`.
+
+### Daily workflow (v0.8.0)
+| Tool | What it does |
+|------|--------------|
+| `morning_brief` | Pre-open command center: regime + posture, key 0DTE levels (spot, expected move, gamma flip, call/put walls, max-pain), the vol complex, high-impact econ events, holdings reporting earnings within ~7 days, your last session result, and the discipline reset. |
+| `eod_wrap` | End-of-day wrap: realized vs target, discipline adherence (stopped at target vs gave back), where the key levels closed, and a snapshot logged to history. |
+| `weekly_review` | This week realized P&L vs your weekly target: Mon-Fri daily breakdown, best/worst day, win rate, progress to goal. |
+| `tilt_detector` | Scans a session trade sequence for tilt: revenge sizing, rushing (shrinking entry gaps), intraday win-rate decay, and trading after a give-back from peak. |
+
+### Wheel & income (v0.8.0)
+| Tool | What it does |
+|------|--------------|
+| `wheel_tracker` | Lifetime wheel scorecard for a symbol: net option premium (calls + puts), contracts sold to open, buy-to-close cost, cycles, share position, and effective cost basis after premium. |
+| `covered_call_writer` | Fresh covered calls to write on a holding: OTM strikes near a target delta across expiries, ranked by annualized yield, with contracts covered and an earnings/ex-dividend-before-expiry flag. |
+| `csp_finder` | Cash-secured puts to sell: OTM strikes near a target delta ranked by annualized yield on the cash secured, with cash required per contract and an earnings flag. |
+| `dividend_calendar` | Projected next ex-dividend dates for your holdings (last ex-date + frequency), with payout cadence, dividend/share, and yield -- drives early-assignment risk on short calls. |
+
+### Risk analytics (v0.8.0)
+| Tool | What it does |
+|------|--------------|
+| `correlation_matrix` | Daily-return correlation across holdings: pairwise matrix, each name average correlation, most/least correlated pairs, and portfolio-wide average -- a true-diversification check. |
+| `account_growth` | Risk/return profile of your current holdings over a period (total return, CAGR, annualized vol, max drawdown, rough Sharpe), valuing today positions back through price history. Synthetic, not actual past account equity. |
+
+### 0DTE execution & tax (v0.8.0)
+| Tool | What it does |
+|------|--------------|
+| `spot_blend` | De-stales the gamma map: compares the delayed CBOE chain spot to a live SPY-implied SPX and flags whether spot has likely crossed the gamma flip or a wall since the snapshot. |
+| `pcs_sizer` | Sizes an SPX put credit spread (ASD 0DTE PCS): short put nearest a target delta, long put a given width below, with net credit, max loss, breakeven, return-on-risk, and an approximate POP. |
+| `event_risk_radar` | What can gap your book in the next N days: high-impact econ events plus holdings reporting earnings, merged into one timeline flagged by what you hold. |
+| `estimated_tax` | Estimated tax set-aside on realized trading gains: YTD short/long-term options P&L x marginal federal + Georgia rates, with a quarterly figure. Trading gains only; not tax advice. |
 
 ## Data sources (no API key required)
 

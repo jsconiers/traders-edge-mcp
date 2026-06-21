@@ -3451,6 +3451,734 @@ async def roll_candidates(underlying: Optional[str] = None,
             "results": results}
 
 
+# ============================================================================
+# v0.8.0 - daily workflow, wheel/income, risk analytics, 0DTE execution
+# ============================================================================
+import statistics as _stats
+
+
+def _safe_dict(x):
+    return x if isinstance(x, dict) else {"error": str(x)[:160]}
+
+
+async def _recent_session_summary():
+    import asyncio
+    from collections import defaultdict
+    orders = await asyncio.to_thread(_rh_recent_option_orders, _today_et() - _dt.timedelta(days=7), 8)
+    by = defaultdict(list)
+    for o in orders:
+        f = _order_to_fill(o)
+        if f:
+            by[f["trade_date"]].append(f)
+    if not by:
+        return None
+    last = max(by.keys())
+    trips = _round_trips(sorted(by[last], key=lambda r: r["time"]))
+    if not trips:
+        return None
+    total = sum(tr["pnl"] for tr in trips)
+    wins = sum(1 for tr in trips if tr["pnl"] > 0)
+    return {"date": last, "pnl$": round(total, 2), "trips": len(trips),
+            "winRate%": round(100 * wins / len(trips), 1)}
+
+
+@mcp.tool()
+async def morning_brief() -> dict:
+    """Pre-open command center: regime + posture, today's key 0DTE levels (spot, expected move, gamma
+    flip, call/put walls, max-pain), the vol complex, high-impact economic events and holdings reporting
+    earnings within ~7 days, your last session result, and the discipline reset. One call, not five.
+    """
+    import asyncio
+    z, rg, vx, ec, ear = await asyncio.gather(
+        zero_dte_exposure(), regime_classifier(), vix_complex(), economic_calendar(),
+        earnings_calendar(days=10), return_exceptions=True)
+    z, rg, vx, ec, ear = (_safe_dict(z), _safe_dict(rg), _safe_dict(vx), _safe_dict(ec), _safe_dict(ear))
+    today = _today_et()
+    ev = []
+    for e in (ec.get("events") or []):
+        try:
+            d = _dt.date.fromisoformat(e["date"][:10])
+        except Exception:
+            continue
+        if today <= d <= today + _dt.timedelta(days=2) and e.get("importance") in ("high", "medium"):
+            ev.append({"date": e["date"], "time": e.get("time"), "name": e.get("name"),
+                       "importance": e.get("importance")})
+    earnings_soon = [r for r in (ear.get("nextEarnings") or [])
+                     if r.get("daysAway") is not None and r["daysAway"] <= 7]
+    idx = (vx.get("indices") or {})
+    em = z.get("expectedMove") or {}
+    cw, pw = (z.get("callWall") or {}), (z.get("putWall") or {})
+    out = {
+        "date": today.isoformat(),
+        "regime": {"label": rg.get("regime"), "score": rg.get("compositeScore"),
+                   "posture": rg.get("posture")},
+        "levels": {"spot": z.get("spot"), "asof": z.get("asof"),
+                   "expectedMovePts": em.get("expectedMovePts"), "expectedMovePct": em.get("expectedMovePct"),
+                   "gammaFlip": z.get("gammaFlip"), "spotVsFlip": z.get("spotVsFlip"),
+                   "callWall": cw.get("strike"), "putWall": pw.get("strike"),
+                   "maxPain": z.get("maxPainPin"), "gexRegime": z.get("regime")},
+        "vol": {"vix": (idx.get("VIX") or {}).get("value"), "vix1d": (idx.get("VIX1D") or {}).get("value"),
+                "vix9d": (idx.get("VIX9D") or {}).get("value")},
+        "economicEventsNext2d": ev,
+        "earningsNext7d": [{"symbol": r["symbol"], "date": r["date"], "session": r.get("session"),
+                            "daysAway": r["daysAway"]} for r in earnings_soon],
+    }
+    try:
+        ls = await _recent_session_summary()
+        if ls:
+            out["lastSession"] = ls
+    except Exception:
+        pass
+    out["disciplineReset"] = "Fresh day - target and give-back limits reset. Run should_i_trade first."
+    return out
+
+
+@mcp.tool()
+async def eod_wrap() -> dict:
+    """End-of-day wrap: today realized vs target, discipline adherence (stopped at target vs gave back),
+    where the key 0DTE levels closed, and a snapshot logged to SQLite history. Run after the close to
+    score the day and capture closing state.
+    """
+    import asyncio
+    dr, sit, snap = await asyncio.gather(daily_review(), should_i_trade(), snapshot_log(),
+                                         return_exceptions=True)
+    dr, sit, snap = _safe_dict(dr), _safe_dict(sit), _safe_dict(snap)
+    out = {"date": _today_et().isoformat()}
+    if "pnl$" in dr:
+        out["result"] = {"realized$": dr.get("pnl$"), "trips": dr.get("trades"),
+                         "winRate%": dr.get("winRate%"), "targetHitAt": dr.get("targetHitAt"),
+                         "beforeTarget": dr.get("beforeTarget"), "afterTarget": dr.get("afterTarget")}
+    else:
+        out["result"] = {"note": dr.get("note") or dr.get("error") or "no fills today"}
+    tgt = _target()
+    realized = dr.get("pnl$")
+    after = (dr.get("afterTarget") or {})
+    notes = []
+    if dr.get("targetHitAt"):
+        ap = after.get("pnl$")
+        if ap is not None and ap < 0:
+            notes.append(f"Hit target at {dr['targetHitAt']}, then gave back ${ap:.2f} after - the leak pattern.")
+        elif ap is not None and ap > 0:
+            notes.append(f"Hit target at {dr['targetHitAt']} and added ${ap:.2f} after.")
+        else:
+            notes.append(f"Hit target at {dr['targetHitAt']}.")
+    elif realized is not None:
+        notes.append(f"Target ${tgt:.0f} not reached (realized ${realized:.2f}).")
+    out["discipline"] = {"verdict": sit.get("verdict"), "notes": notes}
+    if isinstance(snap, dict) and snap.get("logged"):
+        s = snap.get("snapshot") or {}
+        out["closingLevels"] = {"spot": s.get("spot"), "gammaFlip": s.get("gamma_flip"),
+                                "callWall": s.get("call_wall"), "putWall": s.get("put_wall"),
+                                "vix": s.get("vix"), "regime": s.get("regime")}
+        out["snapshotLogged"] = True
+    else:
+        out["snapshotLogged"] = False
+    return out
+
+
+@mcp.tool()
+async def weekly_review(week_offset: Annotated[int, Field(ge=0, le=12)] = 0) -> dict:
+    """This week realized P&L vs your weekly target: Mon-Fri daily breakdown, best/worst day, win rate,
+    and progress to goal. week_offset looks back N weeks (0 = current). Set a goal with
+    trading_config(action=set, key=weekly_target, value=2500).
+    """
+    import asyncio
+    from collections import defaultdict
+    today = _today_et()
+    monday = today - _dt.timedelta(days=today.weekday()) - _dt.timedelta(weeks=week_offset)
+    friday = monday + _dt.timedelta(days=4)
+    orders = await asyncio.to_thread(_rh_recent_option_orders, monday, 20)
+    by = defaultdict(list)
+    for o in orders:
+        f = _order_to_fill(o)
+        if f and monday.isoformat() <= f["trade_date"] <= friday.isoformat():
+            by[f["trade_date"]].append(f)
+    days, total, alltrips = [], 0.0, []
+    for d in sorted(by.keys()):
+        trips = _round_trips(sorted(by[d], key=lambda r: r["time"]))
+        if not trips:
+            continue
+        p = sum(tr["pnl"] for tr in trips)
+        total += p
+        alltrips += trips
+        days.append({"date": d, "day": _dt.date.fromisoformat(d).strftime("%a"),
+                     "pnl$": round(p, 2), "trips": len(trips)})
+    wt = _cfg("weekly_target")
+    wins = sum(1 for tr in alltrips if tr["pnl"] > 0)
+    out = {"week": f"{monday.isoformat()} to {friday.isoformat()}", "realized$": round(total, 2),
+           "tradingDays": len(days), "roundTrips": len(alltrips),
+           "winRate%": round(100 * wins / len(alltrips), 1) if alltrips else None, "byDay": days,
+           "bestDay": max(days, key=lambda d: d["pnl$"]) if days else None,
+           "worstDay": min(days, key=lambda d: d["pnl$"]) if days else None}
+    if wt:
+        out["weeklyTarget$"] = float(wt)
+        out["pctOfWeeklyTarget"] = round(100 * total / float(wt), 1) if float(wt) else None
+        out["overUnder$"] = round(total - float(wt), 2)
+    else:
+        out["weeklyTargetNote"] = "No weekly_target set. Use trading_config to set one."
+    return out
+
+
+@mcp.tool()
+async def tilt_detector(date: Optional[str] = None) -> dict:
+    """Scan a session trade sequence for tilt: revenge sizing (size up after losses), rushing (shrinking
+    time between entries), intraday win-rate decay, and trading after a give-back from peak. Flags tilt
+    while there is still time to stop. date (ET) defaults to today.
+    """
+    import asyncio
+    d = date or _today_et().isoformat()
+    orders = await asyncio.to_thread(_rh_recent_option_orders, _dt.date.fromisoformat(d), 10)
+    fills = [f for o in orders if (f := _order_to_fill(o)) and f["trade_date"] == d]
+    if not fills:
+        return {"date": d, "note": "No fills for this session."}
+    fills.sort(key=lambda r: r["time"])
+    trips = _round_trips(fills)
+    if len(trips) < 4:
+        return {"date": d, "roundTrips": len(trips),
+                "note": f"Only {len(trips)} round trips - too few to assess tilt."}
+    flags, ev = [], {}
+    after_loss, after_win = [], []
+    for i in range(1, len(trips)):
+        (after_loss if trips[i - 1]["pnl"] < 0 else after_win).append(abs(trips[i]["qty"]))
+    al = _stats.mean(after_loss) if after_loss else 0.0
+    aw = _stats.mean(after_win) if after_win else 0.0
+    ev["avgQtyAfterLoss"], ev["avgQtyAfterWin"] = round(al, 2), round(aw, 2)
+    if aw > 0 and al > 1.25 * aw:
+        flags.append(f"Revenge sizing: avg {al:.1f} contracts after a loss vs {aw:.1f} after a win.")
+    opens = sorted(tr["open"] for tr in trips)
+    gaps = [(opens[i] - opens[i - 1]).total_seconds() for i in range(1, len(opens))]
+    if len(gaps) >= 6:
+        third = len(gaps) // 3
+        early, late = _stats.mean(gaps[:third]), _stats.mean(gaps[-third:])
+        ev["avgGapEarlyMin"], ev["avgGapLateMin"] = round(early / 60, 1), round(late / 60, 1)
+        if early > 0 and late < 0.6 * early:
+            flags.append(f"Rushing: entries ~{late / 60:.0f}m apart late vs ~{early / 60:.0f}m early.")
+    half = len(trips) // 2
+    fw = sum(1 for tr in trips[:half] if tr["pnl"] > 0) / half
+    sw = sum(1 for tr in trips[half:] if tr["pnl"] > 0) / (len(trips) - half)
+    ev["winRateFirstHalf%"], ev["winRateSecondHalf%"] = round(100 * fw, 0), round(100 * sw, 0)
+    if sw < fw - 0.20:
+        flags.append(f"Win-rate decay: {100 * fw:.0f}% first half -> {100 * sw:.0f}% second half.")
+    cur = _build_curve(trips, _target())
+    if cur.get("crossIdx") is not None:
+        aft = cur["total"] - cur["crossCum"]
+        if aft < 0:
+            flags.append(f"Gave back ${aft:.2f} after hitting target - traded past the stop signal.")
+    cum = peak = ddmax = 0.0
+    for tr in trips:
+        cum += tr["pnl"]
+        peak = max(peak, cum)
+        ddmax = min(ddmax, cum - peak)
+    ev["maxDrawdownFromPeak$"] = round(ddmax, 2)
+    level = ("HIGH" if len(flags) >= 3 else "ELEVATED" if len(flags) == 2
+             else "MILD" if len(flags) == 1 else "NONE")
+    advice = ("Step away - multiple tilt signals present." if level in ("HIGH", "ELEVATED")
+              else "One soft signal; stay disciplined." if level == "MILD"
+              else "No tilt signatures detected.")
+    return {"date": d, "roundTrips": len(trips), "tiltLevel": level, "flags": flags,
+            "evidence": ev, "advice": advice}
+
+
+def _holding_sync(sym: str):
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    h = rh.build_holdings() or {}
+    d = h.get(sym)
+    if not d:
+        return {"shares": 0.0, "avgCost": None, "price": None}
+    return {"shares": _to_float(d.get("quantity")) or 0.0, "avgCost": _to_float(d.get("average_buy_price")),
+            "price": _to_float(d.get("price"))}
+
+
+@mcp.tool()
+async def wheel_tracker(symbol: str = "ICE",
+                        lookback_days: Annotated[int, Field(ge=30, le=1500)] = 365) -> dict:
+    """Lifetime wheel scorecard for a symbol: net option premium collected (calls + puts), contracts
+    sold to open, buy-to-close cost, expiry cycles traded, your share position and average cost, and the
+    effective cost basis after premium. lookback_days bounds the order history scanned.
+    """
+    import asyncio
+    sym = symbol.upper()
+    stop = _today_et() - _dt.timedelta(days=lookback_days)
+    orders = await asyncio.to_thread(_rh_recent_option_orders, stop, 40)
+    calls_credit = puts_credit = btc_debit = 0.0
+    sto_calls = sto_puts = 0
+    expiries = set()
+    for o in orders:
+        f = _order_to_fill(o)
+        if not f or f["chain"] != sym:
+            continue
+        expiries.add(f.get("expiry"))
+        eff, side, cp = f.get("effect"), f.get("side"), f.get("cp")
+        ncf, q = (f.get("net_cf") or 0.0), abs(f.get("qty") or 0)
+        if eff == "open" and side == "sell":
+            if cp == "C":
+                calls_credit += ncf
+                sto_calls += q
+            elif cp == "P":
+                puts_credit += ncf
+                sto_puts += q
+        elif eff == "close" and side == "buy":
+            btc_debit += ncf
+    net_prem = calls_credit + puts_credit + btc_debit
+    hold = await asyncio.to_thread(_holding_sync, sym)
+    shares = hold.get("shares") or 0.0
+    avg = hold.get("avgCost")
+    eff_basis = (avg - net_prem / shares) if (avg and shares > 0) else None
+    return {"symbol": sym, "lookbackDays": lookback_days,
+            "netOptionPremium$": round(net_prem, 2),
+            "callPremium$": round(calls_credit, 2), "putPremium$": round(puts_credit, 2),
+            "buyToCloseCost$": round(btc_debit, 2),
+            "shortCallsSold": sto_calls, "shortPutsSold": sto_puts,
+            "expiryCyclesTraded": len([e for e in expiries if e]),
+            "shares": round(shares, 4), "avgCost$": round(avg, 2) if avg else None,
+            "currentPrice$": hold.get("price"),
+            "effectiveBasisAfterPremium$": round(eff_basis, 2) if eff_basis is not None else None,
+            "basisReductionPerShare$": round(net_prem / shares, 2) if shares > 0 else None,
+            "note": ("Net premium = call+put credits minus buy-to-close debits over the window. "
+                     "Assignment/exercise legs may post separately; verify against statements.")}
+
+
+def _write_scan_sync(symbol, opt_type, target_delta, min_dte, max_dte, n_per_expiry):
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    try:
+        lp = rh.get_latest_price(symbol)
+        px = _to_float(lp[0]) if lp else None
+    except Exception:
+        px = None
+    try:
+        ch = rh.options.get_chains(symbol)
+        exps = ch.get("expiration_dates", []) if isinstance(ch, dict) else []
+    except Exception:
+        exps = []
+    today = _today_et()
+    targets = []
+    for e in exps:
+        try:
+            dte = (_dt.date.fromisoformat(e) - today).days
+        except Exception:
+            continue
+        if min_dte <= dte <= max_dte:
+            targets.append((e, dte))
+    targets = targets[:2]
+    out = []
+    for e, dte in targets:
+        try:
+            opts = rh.options.find_options_by_expiration(symbol, expirationDate=e, optionType=opt_type) or []
+        except Exception:
+            continue
+        rows = []
+        for o in opts:
+            k = _to_float(o.get("strike_price"))
+            if k is None:
+                continue
+            if opt_type == "call" and px and k < px:
+                continue
+            if opt_type == "put" and px and k > px:
+                continue
+            mark = _to_float(o.get("mark_price")) or _to_float(o.get("adjusted_mark_price")) or 0.0
+            delta = _to_float(o.get("delta")) or 0.0
+            rows.append((k, mark, delta, _to_float(o.get("implied_volatility")) or 0.0,
+                         _to_float(o.get("open_interest")) or 0.0))
+        rows.sort(key=lambda r: abs(abs(r[2]) - target_delta))
+        for k, mark, delta, iv, oi in rows[:n_per_expiry]:
+            base = px if opt_type == "call" else k
+            ann = (mark / base) * (365.0 / dte) * 100.0 if (base and dte > 0) else None
+            out.append({"expiry": e, "dte": dte, "strike": k, "markPerSh$": round(mark, 2),
+                        "delta": round(delta, 3), "iv": round(iv, 4), "oi": int(oi),
+                        "premiumPerContract$": round(mark * 100, 2),
+                        "annYield%": round(ann, 1) if ann is not None else None})
+    out.sort(key=lambda c: abs(abs(c["delta"]) - target_delta))
+    return {"underlying": symbol, "underlyingPx": round(px, 2) if px else None, "candidates": out}
+
+
+@mcp.tool()
+async def covered_call_writer(symbol: str = "ICE", target_delta: float = 0.30,
+                              min_dte: int = 25, max_dte: int = 45) -> dict:
+    """Fresh covered calls to write on a symbol you hold: OTM call strikes near your target delta across
+    the next expiries, ranked by annualized yield, with how many contracts your shares cover and a flag
+    for any earnings or ex-dividend date before expiry (early-assignment risk).
+    """
+    import asyncio
+    sym = symbol.upper()
+    scan, hold, ear, div = await asyncio.gather(
+        asyncio.to_thread(_write_scan_sync, sym, "call", target_delta, min_dte, max_dte, 3),
+        asyncio.to_thread(_holding_sync, sym), _next_earnings(sym),
+        asyncio.to_thread(_next_ex_div_sync, sym), return_exceptions=True)
+    scan = _safe_dict(scan)
+    hold = hold if isinstance(hold, dict) else {}
+    shares = hold.get("shares") or 0.0
+    for c in scan.get("candidates", []):
+        flags = []
+        if isinstance(ear, dict) and ear.get("date") and ear["date"] <= c["expiry"]:
+            flags.append(f"earnings {ear['date']} ({ear.get('session')})")
+        if isinstance(div, dict) and div.get("nextExDate") and div["nextExDate"] <= c["expiry"]:
+            flags.append(f"ex-div {div['nextExDate']}")
+        c["riskBeforeExpiry"] = flags or None
+    return {"symbol": sym, "underlyingPx": scan.get("underlyingPx"), "sharesHeld": round(shares, 4),
+            "contractsCovered": int(shares // 100), "targetDelta": target_delta,
+            "candidates": scan.get("candidates", []),
+            "note": "Yield annualized on stock price. Writing more than contractsCovered is uncovered."}
+
+
+@mcp.tool()
+async def csp_finder(symbol: str = "ICE", target_delta: float = 0.30,
+                     min_dte: int = 25, max_dte: int = 45) -> dict:
+    """Cash-secured puts to sell on a symbol: OTM put strikes near your target delta across the next
+    expiries, ranked by annualized yield on the cash secured (strike x100), with cash required per
+    contract and an earnings-before-expiry flag.
+    """
+    import asyncio
+    sym = symbol.upper()
+    scan, ear = await asyncio.gather(
+        asyncio.to_thread(_write_scan_sync, sym, "put", target_delta, min_dte, max_dte, 3),
+        _next_earnings(sym), return_exceptions=True)
+    scan = _safe_dict(scan)
+    for c in scan.get("candidates", []):
+        c["cashSecured$"] = round(c["strike"] * 100, 2)
+        flags = []
+        if isinstance(ear, dict) and ear.get("date") and ear["date"] <= c["expiry"]:
+            flags.append(f"earnings {ear['date']} ({ear.get('session')})")
+        c["riskBeforeExpiry"] = flags or None
+    return {"symbol": sym, "underlyingPx": scan.get("underlyingPx"), "targetDelta": target_delta,
+            "candidates": scan.get("candidates", []),
+            "note": "Yield annualized on cash secured (strike x 100); assignment buys stock at the strike."}
+
+
+def _div_info_sync(symbols):
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    ff = rh.stocks.get_fundamentals(symbols) or []
+    try:
+        prices = rh.stocks.get_latest_price(symbols) or []
+    except Exception:
+        prices = [None] * len(symbols)
+    out = {}
+    for sym, f, p in zip(symbols, ff, prices):
+        if not f:
+            out[sym] = None
+            continue
+        out[sym] = {"dps": _to_float(f.get("dividend_per_share")), "yieldPct": _to_float(f.get("dividend_yield")),
+                    "px": _to_float(p), "lastEx": f.get("ex_dividend_date")}
+    return out
+
+
+def _project_ex(info):
+    from calendar import monthrange
+    dps, yld, px, lastex = info.get("dps"), info.get("yieldPct"), info.get("px"), info.get("lastEx")
+    if not (dps and dps > 0) or not lastex:
+        return {"nextExDate": None, "lastExDate": lastex, "freq": None, "dps": dps, "yieldPct": yld}
+    freq = None
+    if yld and px:
+        per_year = ((yld / 100.0) * px) / dps
+        if per_year > 0:
+            freq = min([1, 2, 4, 12], key=lambda fr: abs(fr - per_year))
+    try:
+        d = _dt.date.fromisoformat(lastex[:10])
+    except Exception:
+        return {"nextExDate": None, "lastExDate": lastex, "freq": freq, "dps": dps, "yieldPct": yld}
+    today = _today_et()
+    nxt = d
+    if freq:
+        step = 12 // freq
+        guard = 0
+        while nxt < today and guard < 36:
+            m = nxt.month - 1 + step
+            y = nxt.year + m // 12
+            m = m % 12 + 1
+            nxt = _dt.date(y, m, min(nxt.day, monthrange(y, m)[1]))
+            guard += 1
+    return {"nextExDate": nxt.isoformat() if nxt >= today else None, "lastExDate": lastex,
+            "freq": freq, "dps": dps, "yieldPct": yld}
+
+
+def _next_ex_div_sync(symbol):
+    info = _div_info_sync([symbol]).get(symbol)
+    return _project_ex(info) if info else None
+
+
+@mcp.tool()
+async def dividend_calendar(symbols: Optional[str] = None,
+                            days: Annotated[int, Field(ge=1, le=400)] = 90) -> dict:
+    """Upcoming ex-dividend dates for your holdings (or a symbol list): estimated next ex-date, payout
+    frequency, dividend per share, and yield. Ex-div dates drive early-assignment risk on short calls.
+    Dates are projected from Robinhood fundamentals (last ex-date + frequency).
+    """
+    import asyncio
+    if symbols:
+        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        pos = await _robinhood_positions()
+        syms = sorted({p["symbol"] for p in pos if p.get("type") == "equity"})
+    if not syms:
+        return {"note": "No symbols to check."}
+    info = await asyncio.to_thread(_div_info_sync, syms)
+    today, rows, none_div = _today_et(), [], []
+    fmap = {1: "annual", 2: "semiannual", 4: "quarterly", 12: "monthly"}
+    for s in syms:
+        i = info.get(s)
+        if not i or not i.get("dps"):
+            none_div.append(s)
+            continue
+        proj = _project_ex(i)
+        nx = proj.get("nextExDate")
+        da = (_dt.date.fromisoformat(nx) - today).days if nx else None
+        rows.append({"symbol": s, "nextExDate": nx, "daysAway": da,
+                     "freq": fmap.get(proj.get("freq")), "dividendPerShare$": proj.get("dps"),
+                     "yieldPct": proj.get("yieldPct"), "withinWindow": (da is not None and da <= days)})
+    rows.sort(key=lambda r: (r["daysAway"] if r["daysAway"] is not None else 9999))
+    return {"windowDays": days, "asof": today.isoformat(), "exDividends": rows, "noDividend": none_div,
+            "note": "Next ex-date is projected (last ex-date + frequency); verify before acting."}
+
+
+def _hist_closes_sync(symbols, span):
+    import robin_stocks.robinhood as rh
+    from collections import defaultdict
+    _rh_login_sync()
+    h = rh.stocks.get_stock_historicals(symbols, interval="day", span=span) or []
+    series = defaultdict(dict)
+    for row in h:
+        s, ts, c = row.get("symbol"), (row.get("begins_at") or "")[:10], _to_float(row.get("close_price"))
+        if s and ts and c:
+            series[s][ts] = c
+    return dict(series)
+
+
+@mcp.tool()
+async def correlation_matrix(lookback_days: Annotated[int, Field(ge=20, le=500)] = 90,
+                             symbols: Optional[str] = None) -> dict:
+    """Daily-return correlation across your holdings (or a symbol list): the pairwise matrix, each name
+    average correlation to the rest, the most/least correlated pairs, and the portfolio-wide average - a
+    true-diversification check (10 tickers that move together are not diversified).
+    """
+    import asyncio
+    import numpy as np
+    if symbols:
+        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        pos = await _robinhood_positions()
+        syms = sorted({p["symbol"] for p in pos if p.get("type") == "equity"})
+    if len(syms) < 2:
+        return {"note": "Need at least 2 symbols."}
+    span = "year" if lookback_days > 180 else "3month" if lookback_days > 30 else "month"
+    series = await asyncio.to_thread(_hist_closes_sync, syms, span)
+    have = {s: series.get(s, {}) for s in syms if series.get(s)}
+    syms = [s for s in syms if s in have]
+    if len(syms) < 2:
+        return {"note": "Insufficient history."}
+    common = sorted(set.intersection(*[set(have[s].keys()) for s in syms]))
+    common = common[-lookback_days:] if len(common) > lookback_days else common
+    if len(common) < 10:
+        return {"note": f"Only {len(common)} overlapping days of history."}
+    rets = {s: np.diff(np.log([have[s][d] for d in common])) for s in syms}
+    M = np.array([rets[s] for s in syms])
+    C = np.corrcoef(M)
+    matrix = {syms[i]: {syms[j]: round(float(C[i, j]), 2) for j in range(len(syms))}
+              for i in range(len(syms))}
+    avg = {s: round(float(np.mean([C[i, j] for j in range(len(syms)) if j != i])), 2)
+           for i, s in enumerate(syms)}
+    pairs = [(syms[i], syms[j], round(float(C[i, j]), 2))
+             for i in range(len(syms)) for j in range(i + 1, len(syms))]
+    pairs.sort(key=lambda x: -x[2])
+    return {"lookbackDays": len(common), "symbols": syms, "matrix": matrix, "avgCorrelation": avg,
+            "mostCorrelated": [{"pair": f"{a}/{b}", "corr": c} for a, b, c in pairs[:3]],
+            "leastCorrelated": [{"pair": f"{a}/{b}", "corr": c} for a, b, c in pairs[-3:]],
+            "portfolioAvgCorr": round(float(np.mean([p[2] for p in pairs])), 2),
+            "note": "High average correlation = less true diversification than the ticker count implies."}
+
+
+@mcp.tool()
+async def account_growth(span: str = "year") -> dict:
+    """Risk/return profile of your CURRENT holdings over the period: total return, CAGR, annualized
+    volatility, max drawdown, and a rough Sharpe - computed by valuing today positions back through
+    price history. Robinhood removed account-equity history, so this is the current allocation
+    historical profile, not your actual past equity. span: month, 3month, year, 5year.
+    """
+    import asyncio
+    import numpy as np
+    span = span if span in ("month", "3month", "year", "5year") else "year"
+    pos = await _robinhood_positions()
+    eq = [(p["symbol"], p.get("qty") or 0.0) for p in pos
+          if p.get("type") == "equity" and (p.get("qty") or 0) > 0]
+    if not eq:
+        return {"note": "No equity holdings."}
+    syms = [s for s, _ in eq]
+    series = await asyncio.to_thread(_hist_closes_sync, syms, span)
+    have = {s: series.get(s, {}) for s in syms if series.get(s)}
+    syms = [s for s in syms if s in have]
+    if not syms:
+        return {"note": "No price history available."}
+    common = sorted(set.intersection(*[set(have[s].keys()) for s in syms]))
+    if len(common) < 10:
+        return {"note": f"Only {len(common)} overlapping days of history."}
+    qty = {s: q for s, q in eq}
+    port = np.array([sum(qty[s] * have[s][d] for s in syms) for d in common])
+    rets = np.diff(np.log(port))
+    yrs = len(common) / 252.0
+    cagr = (port[-1] / port[0]) ** (1 / yrs) - 1 if yrs > 0 and port[0] > 0 else None
+    vol = float(np.std(rets) * np.sqrt(252))
+    peak = np.maximum.accumulate(port)
+    maxdd = float(((port - peak) / peak).min())
+    sharpe = float((np.mean(rets) * 252 - RISK_FREE) / vol) if vol > 0 else None
+    return {"span": span, "days": len(common), "holdings": len(syms),
+            "startValue$": round(float(port[0]), 2), "endValue$": round(float(port[-1]), 2),
+            "totalReturn%": round(100 * (port[-1] / port[0] - 1), 2),
+            "cagr%": round(100 * cagr, 2) if cagr is not None else None,
+            "annualizedVol%": round(100 * vol, 2), "maxDrawdown%": round(100 * maxdd, 2),
+            "sharpe": round(sharpe, 2) if sharpe is not None else None,
+            "note": "Synthetic: current holdings valued through history; not actual account equity."}
+
+
+def _spy_live_sync():
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    try:
+        p = rh.stocks.get_latest_price("SPY", includeExtendedHours=True)
+        return _to_float(p[0]) if p and p[0] else None
+    except Exception:
+        return None
+
+
+@mcp.tool()
+async def spot_blend(spy_mult: float = 10.0, basis: float = 0.0) -> dict:
+    """De-stale the gamma map: compares the delayed CBOE chain spot (~15 min) to a live SPY-implied SPX
+    (SPY x spy_mult + basis) and reports the gap and whether spot has likely crossed the gamma flip or a
+    wall since the snapshot. SPYx10 carries a ~20-40pt dividend basis to SPX - pass basis to calibrate
+    against a real SPX print.
+    """
+    import asyncio
+    z = await zero_dte_exposure()
+    if isinstance(z, dict) and "error" in z:
+        return {"error": z["error"]}
+    spy = await asyncio.to_thread(_spy_live_sync)
+    chain_spot, flip = z.get("spot"), z.get("gammaFlip")
+    cw = (z.get("callWall") or {}).get("strike")
+    pw = (z.get("putWall") or {}).get("strike")
+    asof = z.get("asof")
+    age_min = None
+    try:
+        if asof:
+            ad = _dt.datetime.fromisoformat(asof.replace("Z", "+00:00"))
+            age_min = round((_dt.datetime.now(_dt.timezone.utc) - ad).total_seconds() / 60, 1)
+    except Exception:
+        pass
+    spx_est = (spy * spy_mult + basis) if spy else None
+    gap = round(spx_est - chain_spot, 1) if (spx_est and chain_spot) else None
+
+    def side(level):
+        if not (spx_est and chain_spot and level):
+            return None
+        was = "above" if chain_spot > level else "below"
+        now = "above" if spx_est > level else "below"
+        return {"level": level, "chainSide": was, "liveSide": now, "crossed": was != now}
+
+    return {"chainSpot": chain_spot, "chainAgeMin": age_min, "spyLive": spy, "spyMult": spy_mult,
+            "basis": basis, "spxLiveEst": round(spx_est, 1) if spx_est else None, "gapPts": gap,
+            "vsGammaFlip": side(flip), "vsCallWall": side(cw), "vsPutWall": side(pw),
+            "note": "spxLiveEst = SPY*mult + basis. Calibrate basis to a real SPX quote for accuracy."}
+
+
+@mcp.tool()
+async def pcs_sizer(short_delta: float = 0.30, width: float = 10.0,
+                    expiry: Optional[str] = None) -> dict:
+    """Size an SPX put credit spread (your ASD 0DTE PCS): from the live chain it picks the short put
+    nearest short_delta and the long put width points below, then reports net credit, max loss,
+    breakeven, return-on-risk, and an approximate probability of profit. expiry defaults to 0DTE.
+    """
+    chain = await _load_chain()
+    spot = chain.get("spot")
+    opts = chain.get("options") or []
+    exp = expiry or _nearest_expiry(opts, "SPXW")
+    puts = [o for o in _filter(opts, root="SPXW", expiration=exp)
+            if o.get("cp") == "P" and o.get("strike")]
+    if not puts:
+        return {"error": f"No SPXW puts found for {exp}."}
+    with_delta = [o for o in puts if o.get("delta") is not None]
+    if not with_delta:
+        return {"error": "No delta data on puts."}
+    short = min(with_delta, key=lambda o: abs(abs(o["delta"]) - short_delta))
+    ks = short["strike"]
+    longs = [o for o in puts if o["strike"] <= ks - 0.01]
+    if not longs:
+        return {"error": "No long put strike below the short available."}
+    longp = min(longs, key=lambda o: abs(o["strike"] - (ks - width)))
+    actual_width = round(ks - longp["strike"], 2)
+    sc, lc = (short.get("mid") or 0.0), (longp.get("mid") or 0.0)
+    credit = round(sc - lc, 2)
+    maxloss = round(actual_width - credit, 2)
+    return {"expiry": exp, "spot": spot,
+            "shortPut": {"strike": ks, "delta": round(short["delta"], 3), "mid": round(sc, 2)},
+            "longPut": {"strike": longp["strike"], "delta": round(longp.get("delta") or 0.0, 3),
+                        "mid": round(lc, 2)},
+            "width": actual_width, "creditPerSh$": credit, "creditPerContract$": round(credit * 100, 2),
+            "maxLossPerSh$": maxloss, "maxLossPerContract$": round(maxloss * 100, 2),
+            "breakeven": round(ks - credit, 2),
+            "returnOnRisk%": round(100 * credit / maxloss, 1) if maxloss > 0 else None,
+            "approxPOP%": round(100 * (1 - abs(short["delta"])), 1),
+            "note": ("approxPOP ~ P(short put expires OTM) = 1-abs(delta); true POP is a bit higher. "
+                     "Mids are ~15-min delayed.")}
+
+
+@mcp.tool()
+async def event_risk_radar(days: Annotated[int, Field(ge=1, le=60)] = 7) -> dict:
+    """What can gap your book in the next N days: high-impact economic events plus any holdings
+    reporting earnings, merged into one timeline flagged by what you hold. Combines the economic and
+    single-name earnings calendars with your positions.
+    """
+    import asyncio
+    ec, ear, pos = await asyncio.gather(economic_calendar(), earnings_calendar(days=days),
+                                        _robinhood_positions(), return_exceptions=True)
+    today = _today_et()
+    horizon = today + _dt.timedelta(days=days)
+    items = []
+    if isinstance(ec, dict):
+        for e in (ec.get("events") or []):
+            try:
+                dd = _dt.date.fromisoformat(e["date"][:10])
+            except Exception:
+                continue
+            if today <= dd <= horizon and e.get("importance") == "high":
+                items.append({"date": e["date"], "type": "economic", "name": e.get("name"),
+                              "importance": "high", "daysAway": (dd - today).days})
+    held = {p["symbol"] for p in pos if p.get("type") == "equity"} if isinstance(pos, list) else set()
+    if isinstance(ear, dict):
+        for r in (ear.get("nextEarnings") or []):
+            if r.get("withinWindow"):
+                items.append({"date": r["date"], "type": "earnings", "name": f"{r['symbol']} earnings",
+                              "session": r.get("session"), "held": r["symbol"] in held,
+                              "daysAway": r.get("daysAway")})
+    items.sort(key=lambda x: (x["daysAway"] if x.get("daysAway") is not None else 999))
+    return {"windowDays": days, "asof": today.isoformat(), "eventCount": len(items), "timeline": items,
+            "note": "High-impact macro + earnings in your holdings. Size down into binary events."}
+
+
+@mcp.tool()
+async def estimated_tax(year: Optional[int] = None, fed_rate: float = 0.35,
+                        state_rate: float = 0.0549) -> dict:
+    """Estimated tax set-aside on your realized trading gains: pulls YTD realized short/long-term options
+    P&L and applies your marginal federal + Georgia rates, with a quarterly figure. Short-term is taxed
+    as ordinary income. Trading gains only - excludes W-2/Schedule C/clergy; not tax advice.
+    """
+    ts = await tax_summary(year=year)
+    if "realizedTotal$" not in ts:
+        base = {k: ts[k] for k in ("year", "error", "note") if k in ts}
+        return {**base, "note": ts.get("note") or "No realized P&L to estimate."}
+    st = ts.get("shortTerm$", 0.0) or 0.0
+    lt = ts.get("longTerm$", 0.0) or 0.0
+    fed_st = max(0.0, st) * fed_rate
+    st_state = max(0.0, st) * state_rate
+    ltcg = max(0.0, lt) * 0.15
+    lt_state = max(0.0, lt) * state_rate
+    total = fed_st + st_state + ltcg + lt_state
+    return {"year": ts.get("year"), "realizedShortTerm$": round(st, 2), "realizedLongTerm$": round(lt, 2),
+            "assumedFedRate": fed_rate, "assumedStateRate": state_rate,
+            "estShortTermTax$": round(fed_st + st_state, 2), "estLongTermTax$": round(ltcg + lt_state, 2),
+            "estTotalSetAside$": round(total, 2), "quarterlySetAside$": round(total / 4, 2),
+            "note": ("Trading gains only; short-term taxed as ordinary income. Excludes W-2 / Schedule C "
+                     "/ clergy housing. Verify with your CPA.")}
+
+
 def main() -> None:
     log.info("Starting Traders Edge MCP server (stdio); risk-free=%.3f", RISK_FREE)
     mcp.run()

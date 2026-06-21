@@ -3,6 +3,50 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.8.0] - 2026-06-20
+
+### Added — 14 tools (48 -> 62)
+
+**Daily workflow**
+- **`morning_brief`** — pre-open command center: regime + posture, key 0DTE levels (spot, expected
+  move, gamma flip, call/put walls, max-pain), vol complex, high-impact econ events, holdings earnings
+  within ~7 days, last session result, and the discipline reset. Pure composition of existing tools.
+- **`eod_wrap`** — end-of-day wrap: realized vs target, discipline adherence (stop-at-target vs
+  give-back), closing levels, and a snapshot logged to SQLite history.
+- **`weekly_review`** — week realized P&L vs the `weekly_target` config: Mon-Fri breakdown, best/worst
+  day, win rate, progress to goal.
+- **`tilt_detector`** — scans a session trade sequence for tilt signatures: revenge sizing, rushing
+  (shrinking entry gaps), intraday win-rate decay, and trading after a give-back from peak.
+
+**Wheel & income**
+- **`wheel_tracker`** — lifetime wheel scorecard for a symbol: net premium (calls + puts), contracts
+  sold to open, buy-to-close cost, cycles, shares/avg cost, and effective basis after premium.
+- **`covered_call_writer`** — fresh covered calls to write on a holding: OTM strikes near a target
+  delta ranked by annualized yield, contracts covered, and earnings/ex-dividend-before-expiry flags.
+- **`csp_finder`** — cash-secured puts to sell: OTM strikes near a target delta ranked by annualized
+  yield on cash secured, with cash required per contract and an earnings flag.
+- **`dividend_calendar`** — projected next ex-dividend dates for holdings (last ex-date + frequency
+  estimated from yield/dps/price), with cadence, dividend/share, and yield.
+
+**Risk analytics**
+- **`correlation_matrix`** — daily-return correlation across holdings (pairwise matrix, per-name
+  average, most/least correlated pairs, portfolio average) via Robinhood stock historicals.
+- **`account_growth`** — risk/return profile of current holdings (total return, CAGR, annualized vol,
+  max drawdown, rough Sharpe). NOTE: Robinhood removed the portfolio-equity-history endpoint, so this
+  values *current* holdings back through price history — the current allocation profile, not actual
+  past account equity (clearly labeled in output).
+
+**0DTE execution & tax**
+- **`spot_blend`** — de-stales the gamma map: compares the ~15-min-delayed CBOE chain spot to a live
+  SPY-implied SPX (SPX is not quoted on Robinhood) and flags gamma-flip/wall crossings since the
+  snapshot. SPYx10 carries a ~20-40pt dividend basis to SPX; a `basis` param calibrates it.
+- **`pcs_sizer`** — sizes an SPX put credit spread (ASD 0DTE PCS): short put nearest a target delta,
+  long put a width below, with net credit, max loss, breakeven, return-on-risk, and approximate POP.
+- **`event_risk_radar`** — high-impact econ events + holdings earnings merged into one forward
+  timeline flagged by what you hold.
+- **`estimated_tax`** — estimated set-aside on realized trading gains (YTD short/long-term options P&L
+  x marginal federal + Georgia rates) with a quarterly figure. Trading gains only; not tax advice.
+
 ## [0.7.0] - 2026-06-20
 
 ### Added
