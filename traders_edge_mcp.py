@@ -265,6 +265,163 @@ def _nearest_expiry(options: list, root: str = "SPXW") -> Optional[str]:
     return exps[0] if exps else None
 
 
+# ---- Robinhood SPXW chain: PRIMARY 0DTE feed (CBOE delayed = stale-flagged fallback) ----
+RH_CHAIN_TTL = 60.0
+_rh_chain_id_cache = {"id": None, "ts": 0.0}
+
+
+def _rh_sf(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rh_chain_id_sync():
+    """Resolve (and cache ~1h) the Robinhood SPXW options chain_id."""
+    from robin_stocks.robinhood.helper import request_get
+    now = time.monotonic()
+    if _rh_chain_id_cache["id"] and (now - _rh_chain_id_cache["ts"]) < 3600:
+        return _rh_chain_id_cache["id"]
+    probe = request_get("https://api.robinhood.com/options/instruments/", "results",
+                        {"chain_symbol": "SPXW", "state": "active"}) or []
+    cid = probe[0].get("chain_id") if probe else None
+    if cid:
+        _rh_chain_id_cache.update(id=cid, ts=now)
+    return cid
+
+
+def _rh_expiries_sync():
+    """Sorted SPXW expiration dates from Robinhood."""
+    from robin_stocks.robinhood.helper import request_get
+    cid = _rh_chain_id_sync()
+    if not cid:
+        return []
+    detail = request_get(f"https://api.robinhood.com/options/chains/{cid}/", "regular") or {}
+    return sorted(detail.get("expiration_dates", []) or [])
+
+
+def _rh_chain_sync(expiry: str) -> dict:
+    """Pull the SPXW chain for ONE expiry from Robinhood, normalized to the _load_chain shape.
+    Returns {spot, options, asof, source, freshness}. Raises EdgeError if unavailable/too thin.
+    spot is parity-implied (C-P at ATM) so it tracks live during RTH; Greeks are recomputed
+    downstream from iv, so only strike/cp/oi/iv/mid/delta need to be accurate here."""
+    import robin_stocks.robinhood as rh
+    from robin_stocks.robinhood.helper import request_get
+    _rh_login_sync()
+    cid = _rh_chain_id_sync()
+    if not cid:
+        raise EdgeError("RH SPXW chain_id unresolved")
+    insts = []
+    for ot in ("call", "put"):
+        found = request_get("https://api.robinhood.com/options/instruments/", "pagination",
+                            {"chain_id": cid, "expiration_dates": expiry,
+                             "state": "active", "type": ot}) or []
+        insts += found
+    if not insts:
+        raise EdgeError(f"RH returned no SPXW instruments for {expiry}")
+    if len(insts) > 1500:
+        try:
+            spy = _rh_sf((rh.get_quotes(["SPY"]) or [{}])[0].get("last_trade_price")) * 10.0
+        except Exception:
+            spy = 0.0
+        if spy > 0:
+            insts = [c for c in insts if abs(_rh_sf(c.get("strike_price")) - spy) <= 800.0]
+    byid = {c.get("id"): c for c in insts if c.get("id")}
+    ids = list(byid)
+    md_all = []
+    for i in range(0, len(ids), 40):
+        batch = ids[i:i + 40]
+        md = request_get("https://api.robinhood.com/marketdata/options/", "results",
+                         {"ids": ",".join(batch)}) or []
+        md_all += [m for m in md if m]
+    options = []
+    for m in md_all:
+        oid = (m.get("instrument") or "").rstrip("/").split("/")[-1]
+        c = byid.get(oid)
+        if not c:
+            continue
+        cp = "C" if c.get("type") == "call" else "P"
+        K = _rh_sf(c.get("strike_price"))
+        bid = _rh_sf(m.get("bid_price"))
+        ask = _rh_sf(m.get("ask_price"))
+        mark = _rh_sf(m.get("mark_price") or m.get("adjusted_mark_price"))
+        mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else mark
+        options.append({
+            "symbol": c.get("id"), "root": "SPXW", "expiry": expiry, "cp": cp, "strike": K,
+            "bid": bid, "ask": ask, "mid": mid, "iv": _rh_sf(m.get("implied_volatility")),
+            "oi": _rh_sf(m.get("open_interest")), "volume": _rh_sf(m.get("volume")),
+            "last": _rh_sf(m.get("last_trade_price")), "delta": _rh_sf(m.get("delta")),
+            "gamma": _rh_sf(m.get("gamma")),
+        })
+    n_iv = sum(1 for o in options if o["iv"] > 0)
+    n_oi = sum(1 for o in options if o["oi"] > 0)
+    if min(n_iv, n_oi) < 20:
+        raise EdgeError(f"RH SPXW chain too thin (iv:{n_iv} oi:{n_oi}) for {expiry}")
+    strikes = sorted({o["strike"] for o in options})
+    cmid = {o["strike"]: o["mid"] for o in options if o["cp"] == "C"}
+    pmid = {o["strike"]: o["mid"] for o in options if o["cp"] == "P"}
+    par = []
+    for K in strikes:
+        c, p = cmid.get(K), pmid.get(K)
+        if c and p and c > 0 and p > 0:
+            par.append((abs(c - p), K + (c - p)))
+    par.sort()
+    sp = sorted(s for _, s in par[:11])
+    spot = sp[len(sp) // 2] if sp else 0.0
+    open_now = _market_open_et()
+    fresh = {"feed": "robinhood", "marketOpen": open_now,
+             "verdict": "live" if open_now else "last-close", "stale": (not open_now),
+             "paritySpot": round(spot, 2), "strikesWithIV": n_iv, "strikesWithOI": n_oi}
+    asof = _dt.datetime.now(ET).strftime("%Y-%m-%dT%H:%M:%S")
+    return {"spot": spot, "options": options, "asof": asof, "iv30": None,
+            "source": "robinhood_live", "freshness": fresh}
+
+
+async def _load_chain_smart(zero_dte: bool = False, expiration: Optional[str] = None,
+                            root: str = "SPXW", prefer_rh: bool = True) -> dict:
+    """Chain feed for the 0DTE tools: Robinhood live = PRIMARY, CBOE delayed = stale-flagged
+    fallback. All-expiration requests always use CBOE (RH can't pull the whole multi-expiry book).
+    Returns the _load_chain shape plus 'source' and 'freshness'."""
+    import asyncio
+    single = bool(zero_dte or expiration)
+    if prefer_rh and single and root.upper() in ("SPXW", "ALL"):
+        try:
+            exps = await asyncio.to_thread(_rh_expiries_sync)
+            today = _today_et().isoformat()
+            if expiration:
+                target = expiration
+            elif zero_dte:
+                target = today if today in exps else next((e for e in exps if e >= today), None)
+            else:
+                target = None
+            if target:
+                hit = _cache.get(f"rhchain:{target}")
+                if hit and (time.monotonic() - hit[1]) < RH_CHAIN_TTL:
+                    return hit[0]
+                rh_ch = await asyncio.to_thread(_rh_chain_sync, target)
+                _cache[f"rhchain:{target}"] = (rh_ch, time.monotonic())
+                return rh_ch
+        except Exception as exc:  # noqa: BLE001 -- any RH failure falls back to CBOE
+            log.info("RH chain unavailable (%s); falling back to CBOE delayed", str(exc)[:140])
+    ch = dict(await _load_chain())
+    ch["source"] = "cboe_delayed"
+    ch["freshness"] = _staleness(ch.get("asof"))
+    return ch
+
+
+def _feed_warnings(meta: dict) -> list:
+    """Surface requested-but-unavailable position sources prominently (e.g. a stale E*TRADE OAuth
+    that would otherwise silently drop legs from the net Greeks)."""
+    warns = []
+    for src in ("alpaca", "robinhood", "etrade", "file"):
+        err = meta.get(f"{src}Error")
+        if err:
+            warns.append(f"{src} requested but NOT included ({err}) -- its legs are missing from these totals.")
+    return warns
+
+
+
 @mcp.tool()
 async def traders_edge_status() -> dict:
     """Health check: confirms the CBOE options + vol feeds are reachable and reports current spot."""
@@ -490,7 +647,7 @@ async def gamma_exposure(
     net dealer gamma crosses zero. Units: $ per 1% move. ~15-min delayed.
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=zero_dte, expiration=(None if zero_dte else expiration), root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
@@ -506,6 +663,7 @@ async def gamma_exposure(
         "root": root.upper(), "scope": scope, "spot": round(spot, 2),
         "totalGEX": round(total, 0), "totalGEX_$mm_per_1pct": _mm(total),
         "regime": "long gamma (vol-dampening)" if total > 0 else "short gamma (vol-amplifying)",
+        "source": ch.get("source"), "freshness": ch.get("freshness"),
         "gammaFlip": round(flip, 2) if flip else None,
         "spotVsFlip": (None if not flip else
                        ("above flip (stabilizing)" if spot > flip else "below flip (unstable)")),
@@ -563,7 +721,7 @@ async def zero_dte_exposure(root: str = "SPXW") -> dict:
     close on a positive-gamma day; the expected move is the ATM straddle (~1-sigma for the session).
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=True, root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
@@ -588,6 +746,7 @@ async def zero_dte_exposure(root: str = "SPXW") -> dict:
     total = comp["total"]
     out = {
         "expiration": resolved, "spot": round(spot, 2), "asof": ch.get("asof"),
+        "source": ch.get("source"), "freshness": ch.get("freshness"),
         "totalGEX": round(total, 0), "totalGEX_$mm_per_1pct": _mm(total),
         "regime": "long gamma (pinning / mean-revert)" if total > 0 else "short gamma (trend / amplify)",
         "gammaFlip": round(flip, 2) if flip else None,
@@ -1755,6 +1914,12 @@ async def _collect_positions(include_alpaca: bool, include_file: bool, include_r
             meta["file"], meta["filePath"] = len(fpos), path
         except EdgeError as exc:
             meta["fileError"] = str(exc)
+    # explicit per-source inclusion flags (a stale OAuth must not silently drop legs)
+    _req = {"alpaca": include_alpaca, "robinhood": include_robinhood,
+            "etrade": include_etrade, "file": include_file}
+    for _src, _on in _req.items():
+        if _on:
+            meta[f"{_src}Included"] = (f"{_src}Error" not in meta)
     return positions, meta
 
 
@@ -1789,7 +1954,9 @@ async def _aggregate(include_alpaca: bool = True, include_file: bool = True, inc
     chain_by_sym = {o["symbol"]: o for o in (chain["options"] if chain else [])}
     prices = await _price_map(positions, spot)
     risks = [_position_risk(p, chain_by_sym, spot, prices) for p in positions]
-    return {"positions": risks, "spot": spot, "meta": meta}
+    chain_fresh = _staleness(chain.get("asof")) if chain else None
+    return {"positions": risks, "spot": spot, "meta": meta,
+            "chainSource": ("cboe_delayed" if chain else None), "chainFreshness": chain_fresh}
 
 
 @mcp.tool()
@@ -1939,6 +2106,8 @@ async def net_greeks(include_alpaca: bool = True, include_file: bool = True, inc
         "netTheta$_per_day": round(nett, 0),
         "netVega$_per_1pct_vol": round(netv, 0),
         "greeksCoverage": cov,
+        "chainSource": agg.get("chainSource"), "chainFreshness": agg.get("chainFreshness"),
+        "feedWarnings": _feed_warnings(agg["meta"]),
         "sources": agg["meta"],
     }
     return out
@@ -2577,7 +2746,7 @@ async def daily_game_plan(root: str = "SPXW") -> dict:
     max-pain, gamma flip, spot. SPX pins toward max-pain and gamma walls into the close on long-gamma days.
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=True, root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
@@ -2608,6 +2777,7 @@ async def daily_game_plan(root: str = "SPXW") -> dict:
     support = sorted({x for x in [pw[0] if pw else None, em_lv.get("lower1sigma"),
                                   oi_p[0][0] if oi_p else None] if x and x < spot}, reverse=True)
     out = {"root": root.upper(), "expiration": resolved, "spot": round(spot, 2), "asof": ch.get("asof"),
+           "source": ch.get("source"), "freshness": ch.get("freshness"),
            "regime": "long gamma (pin / mean-revert)" if total > 0 else "short gamma (trend / amplify)",
            "totalGEX_$mm_per_1pct": _mm(total),
            "gammaFlip": round(flip, 2) if flip else None,
@@ -4107,7 +4277,7 @@ async def pcs_sizer(short_delta: float = 0.30, width: float = 10.0,
     nearest short_delta and the long put width points below, then reports net credit, max loss,
     breakeven, return-on-risk, and an approximate probability of profit. expiry defaults to 0DTE.
     """
-    chain = await _load_chain()
+    chain = await _load_chain_smart(zero_dte=(expiry is None), expiration=expiry, root="SPXW")
     spot = chain.get("spot")
     opts = chain.get("options") or []
     exp = expiry or _nearest_expiry(opts, "SPXW")
@@ -4129,6 +4299,7 @@ async def pcs_sizer(short_delta: float = 0.30, width: float = 10.0,
     credit = round(sc - lc, 2)
     maxloss = round(actual_width - credit, 2)
     return {"expiry": exp, "spot": spot,
+            "source": chain.get("source"), "freshness": chain.get("freshness"),
             "shortPut": {"strike": ks, "delta": round(short["delta"], 3), "mid": round(sc, 2)},
             "longPut": {"strike": longp["strike"], "delta": round(longp.get("delta") or 0.0, 3),
                         "mid": round(lc, 2)},
@@ -4138,7 +4309,7 @@ async def pcs_sizer(short_delta: float = 0.30, width: float = 10.0,
             "returnOnRisk%": round(100 * credit / maxloss, 1) if maxloss > 0 else None,
             "approxPOP%": round(100 * (1 - abs(short["delta"])), 1),
             "note": ("approxPOP ~ P(short put expires OTM) = 1-abs(delta); true POP is a bit higher. "
-                     "Mids are ~15-min delayed.")}
+                     "Feed in 'source'/'freshness': Robinhood live when market open, else CBOE ~15-min delayed.")}
 
 
 @mcp.tool()
