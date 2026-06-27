@@ -275,6 +275,7 @@ async def traders_edge_status() -> dict:
         out["spot"] = round(ch["spot"], 2)
         out["contracts"] = len(ch["options"])
         out["asof"] = ch.get("asof")
+        out["freshness"] = _staleness(ch.get("asof"))
         out["reachable"] = True
     except EdgeError as exc:
         out["reachable"] = False
@@ -3273,11 +3274,25 @@ async def snapshot_log() -> dict:
     levels drifted (GEX migration). Stored at ~/.trading/traders_edge.db.
     """
     import asyncio
-    z, vx, rg = await asyncio.gather(zero_dte_exposure(), vix_complex(), regime_classifier())
-    if isinstance(z, dict) and "error" in z:
-        return {"error": f"chain unavailable: {z['error']}"}
+    z, vx, rg = await asyncio.gather(zero_dte_exposure(), vix_complex(), regime_classifier(),
+                                     return_exceptions=True)
+    if isinstance(z, Exception) or (isinstance(z, dict) and "error" in z):
+        await asyncio.sleep(0.8)
+        try:
+            z2 = await zero_dte_exposure()
+            if not (isinstance(z2, dict) and "error" in z2):
+                z = z2
+        except Exception:  # noqa: BLE001
+            pass
+    degraded = isinstance(z, Exception) or not isinstance(z, dict) or "error" in z
+    chain_err = None
+    if degraded:
+        chain_err = str(z) if isinstance(z, Exception) else (z.get("error") if isinstance(z, dict) else "unknown")
+        z = {}
+    vx = vx if isinstance(vx, dict) else {}
+    rg = rg if isinstance(rg, dict) else {}
     em = z.get("expectedMove") or {}
-    idx = (vx.get("indices") or {}) if isinstance(vx, dict) else {}
+    idx = vx.get("indices") or {}
     cw, pw = z.get("callWall"), z.get("putWall")
     now = _dt.datetime.now(ET)
     row = {
@@ -3294,10 +3309,15 @@ async def snapshot_log() -> dict:
         await asyncio.to_thread(_snapshot_write_sync, row)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"DB write failed: {str(exc)[:160]}"}
-    return {"logged": True, "db": TE_DB_PATH,
+    out = {"logged": True, "db": TE_DB_PATH,
             "snapshot": {k: row[k] for k in ("ts", "spot", "total_gex", "gamma_flip", "call_wall",
                                              "put_wall", "max_pain", "expected_move", "vix", "vix1d",
                                              "regime", "regime_score")}}
+    if degraded:
+        out["degraded"] = True
+        out["note"] = (f"Chain-derived levels unavailable ({str(chain_err)[:120]}); logged vol/regime "
+                       "only to preserve the intraday timeline.")
+    return out
 
 
 @mcp.tool()
@@ -4041,7 +4061,7 @@ def _spy_live_sync():
 
 
 @mcp.tool()
-async def spot_blend(spy_mult: float = 10.0, basis: float = 0.0) -> dict:
+async def spot_blend(spy_mult: float = 10.0, basis: Optional[float] = None) -> dict:
     """De-stale the gamma map: compares the delayed CBOE chain spot (~15 min) to a live SPY-implied SPX
     (SPY x spy_mult + basis) and reports the gap and whether spot has likely crossed the gamma flip or a
     wall since the snapshot. SPYx10 carries a ~20-40pt dividend basis to SPX - pass basis to calibrate
@@ -4056,14 +4076,13 @@ async def spot_blend(spy_mult: float = 10.0, basis: float = 0.0) -> dict:
     cw = (z.get("callWall") or {}).get("strike")
     pw = (z.get("putWall") or {}).get("strike")
     asof = z.get("asof")
-    age_min = None
-    try:
-        if asof:
-            ad = _dt.datetime.fromisoformat(asof.replace("Z", "+00:00"))
-            age_min = round((_dt.datetime.now(_dt.timezone.utc) - ad).total_seconds() / 60, 1)
-    except Exception:
-        pass
-    spx_est = (spy * spy_mult + basis) if spy else None
+    stl = _staleness(asof)
+    age_min = stl["ageMin"]
+    if basis is None:
+        basis, basis_src = _auto_basis(chain_spot, asof, spy, spy_mult)
+    else:
+        basis_src = "manual"
+    spx_est = (spy * spy_mult + basis) if (spy and basis is not None) else None
     gap = round(spx_est - chain_spot, 1) if (spx_est and chain_spot) else None
 
     def side(level):
@@ -4073,10 +4092,12 @@ async def spot_blend(spy_mult: float = 10.0, basis: float = 0.0) -> dict:
         now = "above" if spx_est > level else "below"
         return {"level": level, "chainSide": was, "liveSide": now, "crossed": was != now}
 
-    return {"chainSpot": chain_spot, "chainAgeMin": age_min, "spyLive": spy, "spyMult": spy_mult,
-            "basis": basis, "spxLiveEst": round(spx_est, 1) if spx_est else None, "gapPts": gap,
+    return {"chainSpot": chain_spot, "chainAgeMin": age_min, "freshness": stl, "spyLive": spy,
+            "spyMult": spy_mult, "basis": basis, "basisSource": basis_src,
+            "spxLiveEst": round(spx_est, 1) if spx_est is not None else None, "gapPts": gap,
             "vsGammaFlip": side(flip), "vsCallWall": side(cw), "vsPutWall": side(pw),
-            "note": "spxLiveEst = SPY*mult + basis. Calibrate basis to a real SPX quote for accuracy."}
+            "note": ("spxLiveEst = SPY*mult + basis; basis auto-calibrated from the chain when fresh "
+                     "(see basisSource). Pass basis= to override.")}
 
 
 @mcp.tool()
@@ -4177,6 +4198,156 @@ async def estimated_tax(year: Optional[int] = None, fed_rate: float = 0.35,
             "estTotalSetAside$": round(total, 2), "quarterlySetAside$": round(total / 4, 2),
             "note": ("Trading gains only; short-term taxed as ordinary income. Excludes W-2 / Schedule C "
                      "/ clergy housing. Verify with your CPA.")}
+
+
+# ============================================================================
+# Feed freshness guards + live-spot calibration
+#   (added: staleness detection and auto-calibrated SPY->SPX basis)
+# ============================================================================
+_basis_cache: dict = {}   # {"basis": float, "ts": monotonic_seconds, "spot": float}
+
+
+def _market_open_et(now: Optional[_dt.datetime] = None) -> bool:
+    """True if the US equity cash session is open right now (Mon-Fri, 09:30-16:00 ET).
+    Holidays are not modeled -- a market holiday on a weekday reads as 'open'."""
+    n = now or _dt.datetime.now(ET)
+    if n.tzinfo is None:
+        n = n.replace(tzinfo=ET)
+    n = n.astimezone(ET)
+    if n.weekday() >= 5:
+        return False
+    mins = n.hour * 60 + n.minute
+    return (9 * 60 + 30) <= mins < (16 * 60)
+
+
+def _parse_asof_et(asof: Optional[str]) -> Optional[_dt.datetime]:
+    """Parse a CBOE asof timestamp into an aware UTC datetime. CBOE's last_trade_time is ISO
+    *without* a timezone and is Eastern, so naive values are interpreted as ET."""
+    if not asof or not isinstance(asof, str):
+        return None
+    try:
+        d = _dt.datetime.fromisoformat(asof.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=ET)
+    return d.astimezone(_dt.timezone.utc)
+
+
+def _staleness(asof: Optional[str], fresh_max_min: float = 16.0,
+               stale_min: float = 20.0) -> dict:
+    """Classify how fresh a CBOE timestamp is. CBOE is inherently ~15 min delayed, so while the cash
+    session is open 'fresh' means within that normal delay; an age beyond ~20 min during market hours
+    means the feed itself is lagging (stale). Outside the session the print is just the prior close."""
+    d_utc = _parse_asof_et(asof)
+    open_now = _market_open_et()
+    if d_utc is None:
+        return {"asof": asof, "ageMin": None, "marketOpen": open_now,
+                "stale": None, "verdict": "unknown"}
+    age_min = round((_dt.datetime.now(_dt.timezone.utc) - d_utc).total_seconds() / 60.0, 1)
+    if not open_now:
+        verdict, stale = "after-hours", False
+    elif age_min <= fresh_max_min:
+        verdict, stale = "fresh", False
+    elif age_min <= stale_min:
+        verdict, stale = "lagging", False
+    else:
+        verdict, stale = "stale", True
+    return {"asof": asof, "ageMin": age_min, "marketOpen": open_now,
+            "stale": stale, "verdict": verdict}
+
+
+def _auto_basis(chain_spot: Optional[float], asof: Optional[str], spy_live: Optional[float],
+                mult: float) -> tuple:
+    """Auto-calibrate the offset in SPX = SPY*mult + basis without a second live feed.
+
+    The SPX/SPY basis (driven by accumulated dividends) is stable intraday. We compute it as
+    chain_spot - spy_live*mult while the CBOE chain is fresh (delayed SPX ~ live within the normal
+    lag) and cache it; once the chain goes stale, that cached fresh basis is reused with the *live*
+    SPY, yielding an accurate live SPX even though the chain spot is old.
+
+    Returns (basis, source) with source in 'live-calibrated' / 'cached-fresh' / 'uncalibrated' /
+    'unavailable'.
+    """
+    stl = _staleness(asof)
+    if chain_spot and spy_live:
+        live_basis = chain_spot - spy_live * mult
+        if stl["verdict"] in ("fresh", "after-hours"):
+            _basis_cache.update({"basis": live_basis, "ts": time.monotonic(), "spot": chain_spot})
+            return round(live_basis, 2), "live-calibrated"
+        cached = _basis_cache.get("basis")
+        if cached is not None and (time.monotonic() - _basis_cache.get("ts", 0)) < 6 * 3600:
+            return round(cached, 2), "cached-fresh"
+        return round(live_basis, 2), "uncalibrated"
+    cached = _basis_cache.get("basis")
+    if cached is not None:
+        return round(cached, 2), "cached-fresh"
+    return None, "unavailable"
+
+
+@mcp.tool()
+async def feed_health() -> dict:
+    """One-stop 'can I trust the data right now?' for 0DTE work. Reports CBOE chain freshness (age and a
+    stale flag judged against market hours) and overlays a live SPY-implied SPX (auto-calibrated basis)
+    so you can see the live level even when the chain spot is lagging. Check it before acting on gamma
+    levels, max-pain, or expected-move distances.
+    """
+    import asyncio
+    out: dict = {"source": "CBOE delayed options JSON (~15 min) + live SPY overlay"}
+    ch = None
+    for attempt in range(2):
+        try:
+            ch = await _load_chain()
+            break
+        except Exception as exc:  # noqa: BLE001
+            out["chainError"] = str(exc)[:160]
+            if attempt == 0:
+                await asyncio.sleep(0.8)
+    if not ch:
+        out["reachable"] = False
+        out["verdict"] = "DOWN"
+        out["recommendation"] = ("CBOE chain unreachable - do not rely on gamma levels; price off your "
+                                 "broker quote until it recovers.")
+        return out
+    chain_spot = ch.get("spot")
+    stl = _staleness(ch.get("asof"))
+    out["reachable"] = True
+    out["chainSpot"] = round(chain_spot, 2) if chain_spot else None
+    out["freshness"] = stl
+    out["contracts"] = len(ch.get("options") or [])
+    spy = None
+    try:
+        spy = await asyncio.to_thread(_spy_live_sync)
+    except Exception:  # noqa: BLE001
+        spy = None
+    basis, src = _auto_basis(chain_spot, ch.get("asof"), spy, 10.0)
+    spx_est = round(spy * 10.0 + basis, 1) if (spy and basis is not None) else None
+    out["spyLive"] = spy
+    out["basis"] = basis
+    out["basisSource"] = src
+    out["spxLiveEst"] = spx_est
+    out["gapVsChainPts"] = round(spx_est - chain_spot, 1) if (spx_est and chain_spot) else None
+    v = stl["verdict"]
+    if v == "stale":
+        out["verdict"] = "STALE"
+        out["recommendation"] = ("Chain spot is lagging >20 min while the market is open - trust "
+                                 "spxLiveEst over chainSpot for distance-to-flip/walls.")
+    elif v == "lagging":
+        out["verdict"] = "LAGGING"
+        out["recommendation"] = "Chain is slightly behind; cross-check levels against spxLiveEst."
+    elif v == "after-hours":
+        out["verdict"] = "CLOSED"
+        out["recommendation"] = "Market closed - the chain shows the last session's close."
+    elif v == "unknown":
+        out["verdict"] = "UNKNOWN"
+        out["recommendation"] = "Could not parse the feed timestamp; treat freshness as unverified."
+    else:
+        out["verdict"] = "OK"
+        out["recommendation"] = "Chain is within its normal ~15-min delay."
+    if spy is None:
+        out["note"] = ("Live SPY overlay unavailable (broker session) - spxLiveEst may be absent and "
+                       "basis fell back to cache/none.")
+    return out
 
 
 def main() -> None:
