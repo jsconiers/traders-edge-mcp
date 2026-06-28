@@ -75,6 +75,44 @@ def test_max_pain_and_em():
     print("ok max_pain=%.0f, expected_move=%.1f pts" % (mp, em["expectedMovePts"]))
 
 
+def test_rh_sf():
+    assert t._rh_sf("1.5") == 1.5
+    assert t._rh_sf(None) == 0.0
+    assert t._rh_sf("garbage") == 0.0
+    assert t._rh_sf(3) == 3.0
+    print("ok rh_sf")
+
+
+def test_feed_warnings():
+    assert t._feed_warnings({}) == []
+    assert t._feed_warnings({"etrade": 0, "etradeIncluded": True}) == []
+    w = t._feed_warnings({"etradeError": "token expired"})
+    assert len(w) == 1 and "etrade" in w[0] and "token expired" in w[0], w
+    w2 = t._feed_warnings({"robinhoodError": "x", "etradeError": "y"})
+    assert len(w2) == 2, w2
+    print("ok feed_warnings")
+
+
+def test_staleness_none():
+    s = t._staleness(None)
+    assert s["verdict"] == "unknown" and s["asof"] is None, s
+    print("ok staleness(None)")
+
+
+def test_filter_and_nearest():
+    opts = [
+        {"root": "SPXW", "expiry": "2099-01-15", "cp": "C", "strike": 5000.0},
+        {"root": "SPXW", "expiry": "2099-02-19", "cp": "P", "strike": 5000.0},
+        {"root": "SPX", "expiry": "2099-01-15", "cp": "C", "strike": 5000.0},
+    ]
+    assert len(t._filter(opts, root="SPXW")) == 2
+    one = t._filter(opts, root="SPXW", expiration="2099-01-15")
+    assert len(one) == 1 and one[0]["expiry"] == "2099-01-15", one
+    assert len(t._filter(opts, root="ALL")) == 3
+    assert t._nearest_expiry(opts, "SPXW") == "2099-01-15"
+    print("ok filter + nearest_expiry")
+
+
 if __name__ == "__main__":
     test_parse_occ()
     test_year_frac()
@@ -82,4 +120,8 @@ if __name__ == "__main__":
     test_greeks_sanity()
     test_gex_sign_convention()
     test_max_pain_and_em()
+    test_rh_sf()
+    test_feed_warnings()
+    test_staleness_none()
+    test_filter_and_nearest()
     print("\nALL OFFLINE TESTS PASSED")
