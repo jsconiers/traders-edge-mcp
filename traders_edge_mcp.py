@@ -55,7 +55,8 @@ VOL_INDICES = [
 RISK_FREE = float(os.environ.get("TE_RISK_FREE", "0.043"))   # annualized; gamma is ~insensitive
 CONTRACT_MULT = 100                                          # index option contract multiplier
 ET = ZoneInfo("America/New_York")
-CHAIN_TTL = 90.0          # seconds to cache the (large) CBOE chain pull
+CHAIN_TTL = 90.0          # seconds to cache the (large) CBOE chain pull (cash session open)
+CHAIN_TTL_CLOSED = 1800.0 # when the session is closed the chain is static; refetch far less often
 QUOTE_TTL = 60.0
 REQUEST_TIMEOUT = 90.0
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -202,11 +203,15 @@ def _gamma_at(S: float, K: np.ndarray, T: np.ndarray, sigma: np.ndarray,
 
 # ---- chain loading / filtering ---------------------------------------------
 async def _load_chain() -> dict:
-    raw = await _get_json(CBOE_OPTIONS_URL.format(root=SPX_FILE_ROOT), CHAIN_TTL)
+    # The cash session being closed means the CBOE chain is static, so refetch far less often.
+    http_ttl = CHAIN_TTL if _market_open_et() else CHAIN_TTL_CLOSED
+    raw = await _get_json(CBOE_OPTIONS_URL.format(root=SPX_FILE_ROOT), http_ttl)
     d = raw.get("data", {}) or {}
     seq = d.get("seqno") or d.get("last_trade_time")
     pc = _cache.get("__parsed__")
-    if pc and pc[0] == seq and (time.monotonic() - pc[2]) < CHAIN_TTL:
+    # Parse cache is keyed on the feed's sequence number: an unchanged seqno means the chain has not
+    # moved, so there is no reason to re-parse ~30k contracts no matter how long ago we last did.
+    if pc and seq is not None and pc[0] == seq:
         return pc[1]
     spot = float(d.get("current_price") or 0.0)
     opts = []
@@ -425,6 +430,7 @@ def _feed_warnings(meta: dict) -> list:
 @mcp.tool()
 async def traders_edge_status() -> dict:
     """Health check: confirms the CBOE options + vol feeds are reachable and reports current spot."""
+    t0 = time.monotonic()
     out: dict = {"sources": {"options": "CBOE delayed JSON", "vol": "CBOE indices",
                              "events": "TreasuryDirect + curated"}, "note": "Data ~15 min delayed."}
     try:
@@ -437,6 +443,7 @@ async def traders_edge_status() -> dict:
     except EdgeError as exc:
         out["reachable"] = False
         out["error"] = str(exc)
+    out["latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
     return out
 
 
@@ -1817,6 +1824,21 @@ def _etrade_clients():
             pyetrade.ETradeAccessManager(ck, cs, ot, osec))
 
 
+def _etrade_probe_sync() -> dict:
+    """Lightweight liveness probe for the E*TRADE session: reactivate an idle token, then list
+    accounts (a read-only GET). Confirms the token actually works without pulling full portfolios."""
+    accounts, access = _etrade_clients()
+    try:
+        access.renew_access_token()  # reactivate an idle (not expired) token; harmless if active
+    except Exception:  # noqa: BLE001
+        pass
+    a = accounts.list_accounts(resp_format="json")
+    al = _et_dig(a, "AccountListResponse", "Accounts", "Account", default=[])
+    if isinstance(al, dict):
+        al = [al]
+    return {"reachable": True, "accounts": len(al)}
+
+
 def _etrade_collect_sync() -> list:
     import time as _t
     if _et_cache["data"] is not None and (_t.time() - _et_cache["ts"]) < ET_CACHE_TTL:
@@ -1990,8 +2012,24 @@ async def risk_status() -> dict:
         et_lib = True
     except ImportError:
         et_lib = False
-    out["etrade"] = {"libInstalled": et_lib, "envExists": os.path.exists(et_env),
-                     "tokenPickleExists": os.path.exists(et_tok)}
+    et = {"libInstalled": et_lib, "envExists": os.path.exists(et_env),
+          "tokenPickleExists": os.path.exists(et_tok)}
+    # "Token pickle exists" != "logged in": E*TRADE tokens expire at midnight ET, so actually probe it.
+    if et_lib and et["envExists"] and et["tokenPickleExists"]:
+        import asyncio
+        try:
+            probe = await asyncio.wait_for(asyncio.to_thread(_etrade_probe_sync), timeout=10)
+            et.update(probe)
+        except asyncio.TimeoutError:
+            et.update({"reachable": False, "error": "probe timed out (>10s)"})
+        except EdgeError as exc:
+            et.update({"reachable": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            et.update({"reachable": False,
+                       "error": f"{type(exc).__name__}; re-authorize via the etrade MCP"})
+    else:
+        et["reachable"] = False
+    out["etrade"] = et
     _, fpath = _read_positions_file()
     out["positionsFile"] = {"path": fpath, "exists": os.path.exists(fpath)}
     return out
