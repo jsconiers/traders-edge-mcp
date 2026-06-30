@@ -40,6 +40,7 @@ import os
 import csv
 import io
 import sys
+import threading
 import time
 from typing import Annotated, Any, Optional
 from zoneinfo import ZoneInfo
@@ -72,7 +73,7 @@ ET = ZoneInfo("America/New_York")
 CHAIN_TTL = 90.0          # seconds to cache the (large) CBOE chain pull (cash session open)
 CHAIN_TTL_CLOSED = 1800.0 # when the session is closed the chain is static; refetch far less often
 QUOTE_TTL = 60.0
-REQUEST_TIMEOUT = 90.0
+REQUEST_TIMEOUT = 30.0    # per-attempt cap; _get_json retries 3x, so a hung CDN fails fast, not at 90s
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
@@ -1167,6 +1168,12 @@ def _fred_get_client() -> httpx.Client:
     return _fred_client
 
 
+# Cap concurrent hits to FRED's keyless fredgraph endpoint so a burst (e.g. regime_classifier pulling
+# 4 series at once on a cold cache) can't trip rate limiting. These fetches run in to_thread workers,
+# so a threading semaphore is the right primitive; it gates only the HTTP GET below, not cache hits.
+_FRED_HTTP_SEM = threading.BoundedSemaphore(3)
+
+
 class FredError(Exception):
     pass
 
@@ -1187,7 +1194,8 @@ def _fetch_series(series_id: str, start: Optional[str] = None,
     last = None
     for _ in range(3):
         try:
-            r = _fred_get_client().get(FREDGRAPH, params=params)
+            with _FRED_HTTP_SEM:                 # cap concurrent FRED hits (released during backoff)
+                r = _fred_get_client().get(FREDGRAPH, params=params)
             break
         except Exception as exc:  # noqa: BLE001
             last = exc
@@ -3686,13 +3694,18 @@ async def roll_candidates(underlying: Optional[str] = None,
         if not jobs:
             return {"note": "No short calls open and no explicit call specified. Pass underlying, "
                             "current_strike, current_expiry to evaluate a hypothetical roll."}
+    # Roll scans are independent per position, so run them concurrently instead of one-at-a-time.
+    sel = jobs[:5]
+    scans = await asyncio.gather(
+        *[asyncio.to_thread(_roll_scan_sync, sym, k, e, min_dte, max_dte, target_delta, 4)
+          for sym, k, e in sel],
+        return_exceptions=True)
     results = []
-    for sym, k, e in jobs[:5]:
-        try:
-            results.append(await asyncio.to_thread(_roll_scan_sync, sym, k, e, min_dte, max_dte,
-                                                   target_delta, 4))
-        except Exception as exc:  # noqa: BLE001
-            results.append({"underlying": sym, "error": str(exc)[:140]})
+    for (sym, k, e), r in zip(sel, scans):
+        if isinstance(r, Exception):
+            results.append({"underlying": sym, "error": str(r)[:140]})
+        else:
+            results.append(r)
     return {"rollTargets": {"minDte": min_dte, "maxDte": max_dte, "targetDelta": target_delta},
             "results": results}
 
