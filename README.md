@@ -178,14 +178,32 @@ key="daily_target", value="550")`. Editable keys: `daily_target`, `weekly_target
 | `event_risk_radar` | What can gap your book in the next N days: high-impact econ events plus holdings reporting earnings, merged into one timeline flagged by what you hold. |
 | `estimated_tax` | Estimated tax set-aside on realized trading gains: YTD short/long-term options P&L x marginal federal + Georgia rates, with a quarterly figure. Trading gains only; not tax advice. |
 
-## Data sources (no API key required)
+## Data sources
 
-- **CBOE delayed quotes** — the keyless backbone:
-  - Option chain: `https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json`
-    (contains both AM-settled monthly **SPX** and PM-settled **SPXW** weeklies/0DTE — ~32k contracts
-    with open interest, IV, and Greeks).
-  - Vol indices: `https://cdn.cboe.com/api/global/delayed_quotes/quotes/_{SYM}.json`
-- **TreasuryDirect** — live upcoming auctions: `https://www.treasurydirect.gov/TA_WS/securities/upcoming`
+Most **live, historical, and fundamental** data is pulled from the **authenticated Robinhood session**
+(`robin_stocks`). **CBOE** delayed quotes are the keyless chain & volatility backbone, **FRED** supplies
+macro series, and a handful of sources are optional. **Yahoo Finance is used in exactly one place** -- see
+the table.
+
+| Data | Provider | Endpoint / API | Auth | Notes |
+|------|----------|----------------|------|-------|
+| Option chain & Greeks inputs | **CBOE** delayed quotes | `cdn.cboe.com/.../options/_SPX.json` | none | ~15-min delayed; AM **SPX** + PM **SPXW**, ~32k contracts (OI, IV, Greeks) |
+| Vol indices (VIX1D...SKEW) | **CBOE** delayed quotes | `cdn.cboe.com/.../quotes/_{SYM}.json` | none | ~15-min delayed |
+| Live SPY -> SPX overlay | **Robinhood** | `robin_stocks` `get_latest_price` | session | live; de-stales the chain spot |
+| Live-er 0DTE chain (optional path) | **Robinhood** | `api.robinhood.com` options | session | via `_load_chain_smart` |
+| Historical daily closes | **Robinhood** | `get_stock_historicals` | session | correlation / account-growth |
+| Earnings dates | **Robinhood** | `get_earnings` | session | covered-call earnings-before-expiry flag |
+| Dividends / ex-dividend | **Robinhood** | `get_fundamentals` | session | next ex-date is projected |
+| Non-SPX equity-leg pricing | **Yahoo Finance** | `query1.finance.yahoo.com/v8/finance/chart` | none | **the only Yahoo use** -- prices non-SPX equity legs in the risk rollup (`_price_map`) |
+| Macro series (NFCI, spreads, ...) | **FRED** (St. Louis Fed) | `fred.stlouisfed.org/.../fredgraph.csv` | none | key only for series **search** (`FRED_API_KEY`) |
+| Treasury auctions / events | **TreasuryDirect** | `treasurydirect.gov/TA_WS/securities/upcoming` | none | |
+| Economic calendar (tick-precise) | **FMP** or **Finnhub** | `financialmodelingprep.com` / `finnhub.io` | key | optional; without a key the calendar is curated/approx |
+| Positions & account | **Robinhood / Alpaca / E\*TRADE** | respective APIs | session/key | cross-broker aggregator (`risk_summary`, `net_greeks`) |
+
+> **Provider note:** Robinhood is already the authenticated backbone for live/historical/fundamental
+> pulls, so the lone Yahoo dependency could be folded into `robin_stocks` `get_latest_price` to
+> consolidate on a single provider. Yahoo's unauthenticated endpoint is the most rate-limit-prone
+> source in the stack, but it sits **off** the hot 0DTE path.
 
 **Optional:** set `FMP_API_KEY` or `FINNHUB_API_KEY` for a fully live economic calendar (tick-precise
 CPI / PCE / PPI release dates). Without a key, the calendar is built from rule-based releases

@@ -13,10 +13,24 @@ Greeks are recomputed analytically (vectorized Black-Scholes via numpy) from ope
 implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma is realistic. Data is ~15-min
 delayed (fine for positioning and regime); overlay a live broker quote for execution pricing.
 
-Data sources (no API key required):
-  * CBOE delayed quotes:  https://cdn.cboe.com/api/global/delayed_quotes/
-  * TreasuryDirect:       https://www.treasurydirect.gov/TA_WS/securities/upcoming
-Optional: set FMP_API_KEY or FINNHUB_API_KEY for a fully live economic calendar.
+Data sources (provider by data type):
+  Options chain & Greeks inputs    CBOE delayed quotes  (cdn.cboe.com)            no key   ~15-min delayed
+  Vol indices (VIX1D..SKEW)        CBOE delayed quotes  (cdn.cboe.com)            no key   ~15-min delayed
+  Live SPY / SPX overlay           Robinhood            (robin_stocks)           session  live; de-stales chain
+  Live-er 0DTE chain (optional)    Robinhood options    (api.robinhood.com)      session  via _load_chain_smart
+  Historical daily closes          Robinhood            (get_stock_historicals)  session
+  Earnings dates                   Robinhood            (get_earnings)           session
+  Dividends / ex-dividend          Robinhood            (get_fundamentals)       session
+  Non-SPX equity-leg pricing       Yahoo Finance        (query1.finance...)      no key   ONLY Yahoo use (risk rollup)
+  Macro series (NFCI, spreads...)  FRED / St. Louis Fed (fredgraph.csv)          no key   key only for series search
+  Treasury auctions / events       TreasuryDirect       (treasurydirect.gov)     no key
+  Economic calendar (tick-precise) FMP or Finnhub                                key      optional; else curated/approx
+  Positions & account              Robinhood/Alpaca/E*TRADE                      varies   cross-broker aggregator
+
+Most live/historical/fundamental data comes from the authenticated Robinhood session (robin_stocks);
+CBOE is the keyless chain & vol backbone; FRED supplies macro series. Yahoo Finance is used in exactly
+one place (pricing non-SPX equity legs in the risk rollup, _price_map) and could be folded into
+robin_stocks get_latest_price to drop the dependency.
 """
 from __future__ import annotations
 
@@ -1476,6 +1490,10 @@ async def _alpaca_get(path: str) -> Any:
 
 
 async def _yahoo_price(symbol: str) -> Optional[float]:
+    # NOTE: Yahoo Finance is used ONLY here -- pricing non-SPX equity legs for the cross-broker risk
+    # rollup (_price_map). Every other live/historical/fundamental pull uses the Robinhood session
+    # (robin_stocks). Keyless and convenient, but the one anonymous, rate-limit-prone endpoint in the
+    # stack; it could be folded into robin_stocks get_latest_price to drop the Yahoo dependency.
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     try:
         r = await _get_client().get(url, params={"interval": "1d", "range": "1d"})
