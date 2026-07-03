@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (62)
+## Tools (68)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -74,7 +74,7 @@ Macro data is pulled key-less from the FRED fredgraph CSV endpoint.
 | `risk_summary` | Beta-weighted SPX exposure, gross/long/short notional, by-broker & by-underlying breakdowns, top contributors. |
 | `concentration` | Exposure % by underlying; flags names above the threshold (default 25%, `CONCENTRATION_PCT`). |
 | `scenario_shock` | Portfolio P&L across a set of SPX % moves (delta + gamma convexity). |
-| `daily_target` | Today's realized P&L vs your daily target (`DAILY_TARGET`, default $524), with a post-target discipline check. |
+| `daily_target` | Today's realized P&L vs your daily target (`DAILY_TARGET`, default $524), with a post-target discipline check. Realized P&L is sourced from fee-inclusive Robinhood round trips (Alpaca equity-delta is a labeled fallback). |
 | `robinhood_positions` | Live Robinhood holdings (stocks + option legs with broker-provided Greeks). |
 | `etrade_positions` | Live E\*TRADE holdings (stocks + options; SPX/SPXW priced via CBOE). |
 | `alpaca_positions` / `load_positions` | Raw position views from each source. |
@@ -173,10 +173,19 @@ key="daily_target", value="550")`. Editable keys: `daily_target`, `weekly_target
 ### 0DTE execution & tax (v0.8.0)
 | Tool | What it does |
 |------|--------------|
-| `spot_blend` | De-stales the gamma map: compares the delayed CBOE chain spot to a live SPY-implied SPX and flags whether spot has likely crossed the gamma flip or a wall since the snapshot. |
+| `spot_blend` | De-stales the gamma map: compares the delayed CBOE chain spot to a live SPY-implied SPX and flags whether spot has likely crossed the gamma flip or a wall since the snapshot. When no `basis` is passed, the SPY->SPX basis auto-calibrates against the live `index_quote` SPX print. |
 | `pcs_sizer` | Sizes an SPX put credit spread (ASD 0DTE PCS): short put nearest a target delta, long put a given width below, with net credit, max loss, breakeven, return-on-risk, and an approximate POP. |
 | `event_risk_radar` | What can gap your book in the next N days: high-impact econ events plus holdings reporting earnings, merged into one timeline flagged by what you hold. |
 | `estimated_tax` | Estimated tax set-aside on realized trading gains: YTD short/long-term options P&L x marginal federal + Georgia rates, with a quarterly figure. Trading gains only; not tax advice. |
+
+### Robinhood-native (v0.9.0)
+| Tool | What it does |
+|------|--------------|
+| `realized_pnl` | Authoritative realized-P&L check: reconciles the FIFO reconstruction (`daily_pnl_curve` / `tax_summary`) against a fee-inclusive round-trip figure and, when `RH_PNL_HUB_URL` is set, Robinhood's official PnL-hub payload. The reconciliation block isolates fees, expiries/assignments, and unpaired open legs. |
+| `index_quote` | Live SPX / VIX / NDX index levels from Robinhood marketdata -- a real-time print to de-stale the ~15-min CBOE chain and calibrate the SPY->SPX basis. Endpoint pinnable via `RH_INDEX_QUOTE_URL`. |
+| `watchlist_radar` | Catalyst radar across a named Robinhood watchlist: next earnings (BMO/AMC) and projected next ex-dividend per name, flagged within a window, plus P/E and yield, ranked by nearest event. |
+| `earnings_results` | Per-symbol trailing earnings: EPS actual vs estimate, surprise ($ and %), report date and timing, ~8 quarters. |
+| `equity_fundamentals` | Per-symbol snapshot: P/E, P/B, market cap, shares, dividend yield, 52-week range, sector/industry, and a short profile; up to 10 symbols. |
 
 ## Data sources
 

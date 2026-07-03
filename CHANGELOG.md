@@ -3,6 +3,45 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.9.0] - 2026-07-03
+
+### Added — 5 tools (63 -> 68), Robinhood-native
+
+**Realized P&L & reconciliation**
+- **`realized_pnl`** — authoritative realized-P&L check that reconciles the FIFO reconstruction
+  (`daily_pnl_curve` / `tax_summary`) against a fee-inclusive round-trip figure, and — when
+  `RH_PNL_HUB_URL` is set — Robinhood's official PnL-hub ("Wormhole") payload. The `reconciliation`
+  block isolates where the numbers disagree: fees (the reconstruction uses `net_amount` and does not
+  subtract regulatory/ORF fees), expiries/assignments, and unpaired open legs. `feeInclusive$` is the
+  authoritative figure until the hub endpoint is supplied.
+
+**Live index data**
+- **`index_quote`** — live SPX / VIX / NDX index levels straight from Robinhood marketdata (instrument
+  IDs resolved and cached; endpoint pinnable via `RH_INDEX_QUOTE_URL`). A real-time print to de-stale
+  the ~15-min-delayed CBOE chain.
+
+**Watchlist & fundamentals**
+- **`watchlist_radar`** — catalyst radar across a named Robinhood watchlist: next earnings (BMO/AMC)
+  and projected next ex-dividend per name, flagged inside a window, plus P/E and yield, ranked by
+  nearest event. Turns a saved list into one binary/assignment-risk scan.
+- **`earnings_results`** — per-symbol trailing earnings: EPS actual vs estimate, surprise ($ and %),
+  report date and timing, ~8 quarters (Robinhood `get_earnings`).
+- **`equity_fundamentals`** — per-symbol snapshot: P/E, P/B, market cap, shares, dividend yield,
+  52-week range, sector/industry, and a short profile (Robinhood `get_fundamentals`); up to 10 symbols.
+
+### Changed
+- **`daily_target`** — now sources today's realized P&L from the fee-inclusive Robinhood round-trip
+  figure (`_rh_realized_today`) instead of the Alpaca equity-minus-last-equity proxy; Alpaca remains a
+  labeled fallback when the RH session is unavailable, and the `source` field reports which was used.
+- **`spot_blend`** — when no `basis` is passed, calibrates the SPY→SPX basis against the live SPX index
+  print from `index_quote` (`basisSource: "rh_index (SPX print)"`), falling back to the chain-derived
+  auto-basis; adds `spxIndexLive` to the output.
+
+### Notes
+- The Robinhood PnL-hub (`RH_PNL_HUB_URL`) and index-quote (`RH_INDEX_QUOTE_URL`) endpoints are
+  undocumented; both are optional and pinnable, and fail gracefully to the reconstruction / SPY-parity
+  path so nothing breaks when they are unset.
+
 ## [0.8.0] - 2026-06-20
 
 ### Added — 14 tools (48 -> 62)

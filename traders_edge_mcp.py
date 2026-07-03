@@ -2290,14 +2290,19 @@ async def daily_target(
     src = "provided"
     rpl = realized_pl
     if rpl is None:
-        try:
-            acct = await _alpaca_get("/v2/account")
-            eq = float(acct.get("equity") or 0.0)
-            last = float(acct.get("last_equity") or 0.0)
-            rpl = eq - last
-            src = "alpaca (equity - last_equity)"
-        except EdgeError as exc:
-            return {"error": f"No realized_pl provided and Alpaca unavailable: {exc}"}
+        feed = await _rh_realized_today()
+        if feed is not None:
+            rpl = feed["feeInclusiveRealized$"]
+            src = "robinhood (round-trip realized, fee-inclusive)"
+        else:
+            try:
+                acct = await _alpaca_get("/v2/account")
+                eq = float(acct.get("equity") or 0.0)
+                last = float(acct.get("last_equity") or 0.0)
+                rpl = eq - last
+                src = "alpaca (equity - last_equity) [RH feed unavailable]"
+            except EdgeError as exc:
+                return {"error": f"No realized_pl and neither RH fills nor Alpaca available: {exc}"}
     pct = (rpl / tgt * 100.0) if tgt else None
     over = rpl >= tgt
     status = ("TARGET HIT" if over else "below target" if rpl >= 0 else "in drawdown")
@@ -4317,8 +4322,14 @@ async def spot_blend(spy_mult: float = 10.0, basis: Optional[float] = None) -> d
     asof = z.get("asof")
     stl = _staleness(asof)
     age_min = stl["ageMin"]
+    spx_idx = None
     if basis is None:
-        basis, basis_src = _auto_basis(chain_spot, asof, spy, spy_mult)
+        _iq = await asyncio.to_thread(_rh_index_quote_sync, "SPX")
+        spx_idx = (_iq.get("SPX") or {}).get("value") if isinstance(_iq, dict) else None
+        if spx_idx and spy:
+            basis, basis_src = round(spx_idx - spy * spy_mult, 2), "rh_index (SPX print)"
+        else:
+            basis, basis_src = _auto_basis(chain_spot, asof, spy, spy_mult)
     else:
         basis_src = "manual"
     spx_est = (spy * spy_mult + basis) if (spy and basis is not None) else None
@@ -4332,7 +4343,7 @@ async def spot_blend(spy_mult: float = 10.0, basis: Optional[float] = None) -> d
         return {"level": level, "chainSide": was, "liveSide": now, "crossed": was != now}
 
     return {"chainSpot": chain_spot, "chainAgeMin": age_min, "freshness": stl, "spyLive": spy,
-            "spyMult": spy_mult, "basis": basis, "basisSource": basis_src,
+            "spxIndexLive": spx_idx, "spyMult": spy_mult, "basis": basis, "basisSource": basis_src,
             "spxLiveEst": round(spx_est, 1) if spx_est is not None else None, "gapPts": gap,
             "vsGammaFlip": side(flip), "vsCallWall": side(cw), "vsPutWall": side(pw),
             "note": ("spxLiveEst = SPY*mult + basis; basis auto-calibrated from the chain when fresh "
@@ -4593,6 +4604,428 @@ async def feed_health() -> dict:
 def main() -> None:
     log.info("Starting Traders Edge MCP server (stdio); risk-free=%.3f", RISK_FREE)
     mcp.run()
+
+
+# ============================================================================
+# ROBINHOOD-NATIVE ADDITIONS (v0.9.0)
+#   realized_pnl        - official-vs-reconstruction realized-P&L validator + feed
+#   index_quote         - live SPX/VIX/NDX index levels (feeds spot_blend basis)
+#   watchlist_radar     - catalyst radar across a named Robinhood watchlist
+#   earnings_results    - per-symbol EPS actual/estimate/surprise history
+#   equity_fundamentals - per-symbol P/E, mkt cap, div yield, sector, 52wk range
+# All reuse the existing robin_stocks session helpers (_rh_login_sync, request_get,
+# _round_trips, _next_earnings, _div_info_sync, _project_ex, _to_float).
+# ============================================================================
+
+# ---- Realized P&L: authoritative reconciliation of the FIFO reconstruction ----
+# Optional: Robinhood's account-scoped "PnL hub" (internally "Wormhole") realized-P&L endpoint. It is
+# undocumented; when RH_PNL_HUB_URL is set (a URL template that may contain {span} and {account}) it is
+# attached as the top-level official source. Capture it from the app's Realized-P&L page in browser
+# devtools. Until then, the fee-inclusive round-trip figure below is the authoritative number.
+RH_PNL_HUB_URL = os.environ.get("RH_PNL_HUB_URL", "").strip()
+
+_FEE_KEYS = ("regulatory_fees", "total_regulatory_fees", "sec_fees", "orf_fees", "contract_fees")
+
+
+def _rh_order_fees(o: dict) -> float:
+    """Best-effort total fees on one RH option order (reg / exchange / ORF passthrough).
+
+    RH options are commission-free but pass a small per-contract regulatory fee on sells; the FIFO
+    reconstruction in daily_pnl_curve / tax_summary ignores it, which is a chief source of the drift
+    this validator surfaces. Sums the known top-level fee keys plus any per-execution 'fees'.
+    """
+    total = 0.0
+    for k in _FEE_KEYS:
+        total += _to_float(o.get(k)) or 0.0
+    for lg in (o.get("legs") or []):
+        for ex in (lg.get("executions") or []):
+            total += _to_float(ex.get("fees")) or 0.0
+    return round(total, 4)
+
+
+def _rh_realized_recon_sync(date_iso: str) -> dict:
+    """Independent realized-P&L measures for one ET date, from the raw RH option orders.
+
+    Returns the same round-trip realized figure daily_pnl_curve computes (fee-less), plus a
+    fee-inclusive figure and the raw net cash flow, so the three can be cross-checked. The
+    fee-inclusive number is the one that should reconcile to Robinhood's official PnL hub.
+    """
+    target = _dt.date.fromisoformat(date_iso)
+    raw = _rh_recent_option_orders(target)
+    fills, fees = [], 0.0
+    for o in raw:
+        f = _order_to_fill(o)
+        if f and f["trade_date"] == date_iso:
+            fills.append(f)
+            fees += _rh_order_fees(o)
+    fills.sort(key=lambda r: r["time"])
+    trips = _round_trips(fills)
+    rt_realized = round(sum(t["pnl"] for t in trips), 2)   # fee-less; == daily_pnl_curve realized$
+    net_cf = round(sum(f["net_cf"] for f in fills), 2)
+    fee_incl = round(rt_realized - fees, 2)
+    return {"date": date_iso, "orders": len(fills), "roundTrips": len(trips),
+            "roundTripRealized$": rt_realized, "fees$": round(fees, 2),
+            "feeInclusiveRealized$": fee_incl, "netCashFlow$": net_cf,
+            "openOrExpiredDelta$": round(net_cf - rt_realized, 2)}
+
+
+def _rh_pnl_hub_sync(span: str, account_number):
+    """Pull Robinhood's official realized P&L ('PnL hub' / Wormhole) if RH_PNL_HUB_URL is configured.
+
+    The endpoint is account-scoped and undocumented; set RH_PNL_HUB_URL to the captured URL template
+    (may contain {span} and {account}) to enable. Returns the parsed payload, or None when unset/failed.
+    """
+    if not RH_PNL_HUB_URL:
+        return None
+    from robin_stocks.robinhood.helper import request_get
+    _rh_login_sync()
+    url = RH_PNL_HUB_URL.replace("{span}", span).replace("{account}", account_number or "")
+    try:
+        data = request_get(url)
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def _rh_realized_today():
+    """Fee-inclusive realized P&L for today from RH round trips - the primary daily_target feed."""
+    import asyncio
+    try:
+        return await asyncio.to_thread(_rh_realized_recon_sync, _today_et().isoformat())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@mcp.tool()
+async def realized_pnl(date: Optional[str] = None, span: Optional[str] = None,
+                       account_number: Optional[str] = None) -> dict:
+    """Authoritative realized-P&L check: reconciles the FIFO reconstruction (daily_pnl_curve /
+    tax_summary) against fee-inclusive round trips and, when configured, Robinhood's official PnL hub.
+
+    Use it to (a) catch drift/bugs in the reconstruction - the diff isolates fees, expiries/assignments,
+    and rounding - and (b) get a trustworthy realized figure for the session. `date` (YYYY-MM-DD ET)
+    checks one day (default today). `span` (week|month|3month|ytd|all) is passed to the official hub only,
+    when RH_PNL_HUB_URL is set. See the reconciliation block for exactly where the numbers disagree.
+    """
+    import asyncio
+    d = date or _today_et().isoformat()
+    try:
+        recon = await asyncio.to_thread(_rh_realized_recon_sync, d)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+    feeless = recon["roundTripRealized$"]          # the number daily_pnl_curve/tax_summary report
+    authoritative = recon["feeInclusiveRealized$"]
+    out = {"date": d,
+           "reconstructionSource": "robinhood option fills (FIFO round trips)",
+           "reportedByReconstruction$": feeless, "feeInclusive$": authoritative,
+           "reconstruction": recon}
+
+    checks = []
+    if abs(recon["fees$"]) >= 0.01:
+        checks.append(f"daily_pnl_curve/tax_summary omit fees: fee-inclusive realized is "
+                      f"${authoritative:.2f} vs ${feeless:.2f} reconstructed "
+                      f"(${recon['fees$']:.2f} in fees).")
+    if abs(recon["openOrExpiredDelta$"]) > 1.0:
+        checks.append(f"Net cash flow (${recon['netCashFlow$']:.2f}) differs from round-trip realized "
+                      f"by ${recon['openOrExpiredDelta$']:.2f} - a leg expired/assigned or is still open "
+                      f"(not paired into a round trip).")
+    if len(checks) == 0:
+        checks.append("Reconstruction reconciles cleanly (no fees, no unpaired legs) for this date.")
+
+    hub = await asyncio.to_thread(_rh_pnl_hub_sync, (span or "day"), account_number)
+    if hub is not None:
+        out["officialHub"] = hub
+        out["officialHubSource"] = RH_PNL_HUB_URL
+        checks.append("Official RH PnL-hub payload attached under officialHub - diff it against "
+                      "feeInclusive$ to validate the reconstruction end-to-end.")
+    elif RH_PNL_HUB_URL:
+        checks.append("RH_PNL_HUB_URL is set but the hub call returned nothing - verify the URL "
+                      "template and that the account is reachable by this session.")
+    else:
+        checks.append("Set RH_PNL_HUB_URL to Robinhood's PnL-hub endpoint to attach the official number "
+                      "as the top-level source; until then feeInclusive$ is the authoritative figure.")
+
+    out["reconciliation"] = checks
+    return out
+
+
+# ---- Live index levels (SPX / VIX / NDX) via Robinhood marketdata ----
+_RH_INDEX_IDS = {
+    "SPX": os.environ.get("RH_SPX_ID", "432fbbb8-b82c-454a-852d-eb85382c7066"),
+    "VIX": os.environ.get("RH_VIX_ID", "3b912aa2-88f9-4682-8ae3-e39520bdf4db"),
+    "NDX": os.environ.get("RH_NDX_ID", "50c298f7-27a8-44a1-b049-ec153cf2892f"),
+}
+# RH's index-quote endpoint is not officially documented. These candidate templates are tried in order
+# (first hit is cached for the process); override/pin with RH_INDEX_QUOTE_URL ({ids}=comma-joined UUIDs).
+_RH_INDEX_URL_CANDIDATES = [
+    "https://api.robinhood.com/marketdata/indices/quotes/?ids={ids}",
+    "https://api.robinhood.com/marketdata/index/quotes/?ids={ids}",
+    "https://api.robinhood.com/marketdata/quotes/{id}/",
+]
+_rh_index_url_cache = {"url": None}
+
+
+def _rh_index_quote_sync(symbols: str) -> dict:
+    """Live index levels for one or more symbols (comma-separated, e.g. 'SPX,VIX').
+
+    Returns {SYMBOL: {value, asof, source}}. Robinhood's index marketdata endpoint is undocumented, so
+    the first working URL template is discovered once and cached; set RH_INDEX_QUOTE_URL to pin it.
+    """
+    from robin_stocks.robinhood.helper import request_get
+    _rh_login_sync()
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    id_for = {s: _RH_INDEX_IDS.get(s) for s in syms}
+    ids = [i for i in id_for.values() if i]
+    if not ids:
+        return {}
+    ids_join = ",".join(ids)
+    env_url = os.environ.get("RH_INDEX_QUOTE_URL", "").strip()
+    candidates = [env_url] if env_url else []
+    if _rh_index_url_cache["url"]:
+        candidates.append(_rh_index_url_cache["url"])
+    candidates += _RH_INDEX_URL_CANDIDATES
+
+    payload = None
+    for tmpl in candidates:
+        if not tmpl:
+            continue
+        url = tmpl.replace("{ids}", ids_join).replace("{id}", ids[0])
+        try:
+            data = request_get(url)
+        except Exception:  # noqa: BLE001
+            continue
+        rows = None
+        if isinstance(data, dict):
+            rows = data.get("results") or data.get("quotes")
+            if rows is None and data.get("value") is not None:
+                rows = [data]
+        elif isinstance(data, list):
+            rows = data
+        if rows:
+            payload = rows
+            _rh_index_url_cache["url"] = tmpl
+            break
+    if not payload:
+        return {}
+    by_id = {}
+    for row in payload:
+        by_id[row.get("instrument_id") or row.get("id")] = row
+    out = {}
+    for s, iid in id_for.items():
+        row = by_id.get(iid)
+        if not row:
+            continue
+        out[s] = {"value": _to_float(row.get("value") or row.get("last_trade_price")),
+                  "asof": row.get("venue_timestamp") or row.get("updated_at"),
+                  "source": "robinhood_index"}
+    return out
+
+
+@mcp.tool()
+async def index_quote(symbols: str = "SPX,VIX") -> dict:
+    """Live index levels (SPX / VIX / NDX) straight from Robinhood - a real-time print to de-stale the
+    ~15-min CBOE chain and calibrate the SPY->SPX basis used by spot_blend.
+
+    `symbols` is comma-separated (default 'SPX,VIX'). Values track live during RTH; outside the session
+    the print is the prior settle. Returns {SYMBOL: {value, asof}} plus the resolved instrument IDs.
+    """
+    import asyncio
+    try:
+        q = await asyncio.to_thread(_rh_index_quote_sync, symbols)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    if not q:
+        return {"error": ("No index quote returned. RH's index endpoint may have moved - set "
+                          "RH_INDEX_QUOTE_URL to the captured URL template ({ids}=comma-joined UUIDs)."),
+                "triedIds": _RH_INDEX_IDS}
+    return {"indexes": q, "instrumentIds": {s: _RH_INDEX_IDS.get(s) for s in q},
+            "note": "Live from Robinhood marketdata; feeds spot_blend basis when SPX is present."}
+
+
+# ---- Watchlist radar: run the catalyst analytics across a named RH watchlist ----
+def _rh_watchlist_symbols_sync(name: str) -> list:
+    """Equity/ETF symbols in a named Robinhood watchlist (custom or followed), order-preserving."""
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    syms = []
+    try:
+        items = rh.account.get_watchlist_by_name(name) or {}
+        results = items.get("results", items) if isinstance(items, dict) else items
+        for it in (results or []):
+            s = it.get("symbol")
+            if not s:
+                url = it.get("instrument")
+                if url:
+                    try:
+                        s = (rh.helper.request_get(url) or {}).get("symbol")
+                    except Exception:  # noqa: BLE001
+                        s = None
+            if s:
+                syms.append(s.upper())
+    except Exception:  # noqa: BLE001
+        return []
+    seen, out = set(), []
+    for s in syms:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+@mcp.tool()
+async def watchlist_radar(name: str, days: Annotated[int, Field(ge=1, le=120)] = 14) -> dict:
+    """Catalyst radar across a named Robinhood watchlist: for every name, the next earnings date
+    (BMO/AMC) and next ex-dividend date, flagged when they fall inside `days`, plus P/E and yield.
+
+    Turns a saved list (e.g. 'Short Options', 'Weekly Dividend Stocks') into one event scan so you can
+    see which names carry a binary/assignment event before the next covered-call or CSP cycle. Names are
+    matched by the exact list display name (case-sensitive).
+    """
+    import asyncio
+    try:
+        syms = await asyncio.to_thread(_rh_watchlist_symbols_sync, name)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    if not syms:
+        return {"error": f"No equity symbols found in a watchlist named '{name}' "
+                         f"(check the exact, case-sensitive list name)."}
+    earn, div, fund = await asyncio.gather(
+        asyncio.gather(*[_next_earnings(s) for s in syms]),
+        asyncio.to_thread(_div_info_sync, syms),
+        asyncio.to_thread(_fundamentals_sync, syms),
+    )
+    today = _today_et()
+    rows, within = [], 0
+    for s, e in zip(syms, earn):
+        d_info = (div or {}).get(s) or {}
+        proj = _project_ex(d_info) if d_info else {}
+        nx_ex = proj.get("nextExDate")
+        ex_days = (_dt.date.fromisoformat(nx_ex) - today).days if nx_ex else None
+        e_days = e["daysAway"] if e else None
+        f = (fund or {}).get(s) or {}
+        soon = ((e_days is not None and e_days <= days) or (ex_days is not None and ex_days <= days))
+        if soon:
+            within += 1
+        rows.append({"symbol": s,
+                     "nextEarnings": (e or {}).get("date"), "earningsSession": (e or {}).get("session"),
+                     "earningsDaysAway": e_days, "nextExDiv": nx_ex, "exDivDaysAway": ex_days,
+                     "peRatio": f.get("peRatio"), "yieldPct": f.get("dividendYieldPct"),
+                     "eventWithinWindow": soon})
+
+    def _proximity(r):
+        cand = [x for x in (r["earningsDaysAway"], r["exDivDaysAway"]) if x is not None]
+        return min(cand) if cand else 9999
+
+    rows.sort(key=_proximity)
+    return {"watchlist": name, "symbols": len(syms), "windowDays": days,
+            "eventsWithinWindow": within, "radar": rows,
+            "note": "Earnings dates from RH; ex-div projected (last ex + frequency). Verify before acting."}
+
+
+# ---- Per-symbol earnings history (EPS actual / estimate / surprise) ----
+def _rh_earnings_results_sync(symbol: str) -> dict:
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    try:
+        rows = rh.stocks.get_earnings(symbol.upper()) or []
+    except Exception as exc:  # noqa: BLE001
+        raise EdgeError(f"RH earnings fetch failed for {symbol}: {str(exc)[:120]}")
+    out = []
+    for x in rows:
+        eps = x.get("eps") or {}
+        rep = x.get("report") or {}
+        act = _to_float(eps.get("actual"))
+        est = _to_float(eps.get("estimate"))
+        surprise = round(act - est, 4) if (act is not None and est is not None) else None
+        surprise_pct = (round(100.0 * (act - est) / abs(est), 1)
+                        if (act is not None and est not in (None, 0.0)) else None)
+        out.append({"year": x.get("year"), "quarter": x.get("quarter"),
+                    "epsActual": act, "epsEstimate": est,
+                    "surprise": surprise, "surprisePct": surprise_pct,
+                    "reportDate": rep.get("date"), "timing": rep.get("timing"),
+                    "verified": rep.get("verified")})
+    out.sort(key=lambda r: ((r["year"] or 0), (r["quarter"] or 0)))
+    return {"symbol": symbol.upper(), "quarters": out}
+
+
+@mcp.tool()
+async def earnings_results(symbol: str) -> dict:
+    """Trailing earnings for one symbol: EPS actual vs estimate, the surprise ($ and %), report date and
+    timing (BMO/AMC) - up to the last ~8 quarters from Robinhood.
+
+    Use for EPS-surprise history on wheel / covered-call names, to gauge how a stock has handled prior
+    prints before selling premium into the next one.
+    """
+    import asyncio
+    try:
+        res = await asyncio.to_thread(_rh_earnings_results_sync, symbol)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    if not res["quarters"]:
+        return {"symbol": res["symbol"], "note": "No earnings history returned (ETF/fund or unlisted)."}
+    return res
+
+
+# ---- Per-symbol fundamentals (P/E, mkt cap, div yield, sector, 52wk range) ----
+def _fundamentals_sync(symbols) -> dict:
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    syms = (symbols if isinstance(symbols, list)
+            else [s.strip().upper() for s in str(symbols).split(",") if s.strip()])
+    ff = rh.stocks.get_fundamentals(syms) or []
+    out = {}
+    for sym, f in zip(syms, ff):
+        if not f:
+            out[sym] = None
+            continue
+        out[sym] = {
+            "peRatio": _to_float(f.get("pe_ratio")),
+            "pbRatio": _to_float(f.get("pb_ratio")),
+            "marketCap$": _to_float(f.get("market_cap")),
+            "sharesOutstanding": _to_float(f.get("shares_outstanding")),
+            "float": _to_float(f.get("float")),
+            "dividendYieldPct": _to_float(f.get("dividend_yield")),
+            "dividendPerShare$": _to_float(f.get("dividend_per_share")),
+            "high52wk": _to_float(f.get("high_52_weeks")),
+            "low52wk": _to_float(f.get("low_52_weeks")),
+            "avgVolume": _to_float(f.get("average_volume")),
+            "sector": f.get("sector"), "industry": f.get("industry"),
+            "ceo": f.get("ceo"), "hqCity": f.get("headquarters_city"),
+            "hqState": f.get("headquarters_state"),
+            "description": ((f.get("description") or "")[:600] or None),
+        }
+    return out
+
+
+@mcp.tool()
+async def equity_fundamentals(symbols: str) -> dict:
+    """Snapshot fundamentals for one or more symbols (comma-separated): P/E, P/B, market cap, shares,
+    dividend yield, 52-week range, sector/industry, and a short profile - from Robinhood.
+
+    For factoring the underlying business into a wheel / covered-call decision (valuation, yield, size),
+    since the 0DTE tools are SPX-index-only. Max ~10 symbols per call.
+    """
+    import asyncio
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:10]
+    if not syms:
+        return {"error": "Provide at least one symbol."}
+    try:
+        f = await asyncio.to_thread(_fundamentals_sync, syms)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    missing = [s for s in syms if not f.get(s)]
+    return {"fundamentals": {s: v for s, v in f.items() if v}, "notFound": (missing or None)}
 
 
 if __name__ == "__main__":
