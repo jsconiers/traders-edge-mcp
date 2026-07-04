@@ -4883,8 +4883,10 @@ async def watchlist_radar(name: str, days: Annotated[int, Field(ge=1, le=120)] =
     (BMO/AMC) and next ex-dividend date, flagged when they fall inside `days`, plus P/E and yield.
 
     Turns a saved list (e.g. 'Short Options', 'Weekly Dividend Stocks') into one event scan so you can
-    see which names carry a binary/assignment event before the next covered-call or CSP cycle. Names are
-    matched by the exact list display name (case-sensitive).
+    see which names carry a binary/assignment event before the next covered-call or CSP cycle. Each name
+    also carries a local technical read (trendScore + momentumScore, each -2..+2, plus exhaustion /
+    rebound / death-cross flags) from daily bars. Names are matched by the exact list display name
+    (case-sensitive).
     """
     import asyncio
     try:
@@ -4896,10 +4898,11 @@ async def watchlist_radar(name: str, days: Annotated[int, Field(ge=1, le=120)] =
     if not syms:
         return {"error": f"No equity symbols found in a watchlist named '{name}' "
                          f"(check the exact, case-sensitive list name)."}
-    earn, div, fund = await asyncio.gather(
+    earn, div, fund, hist = await asyncio.gather(
         asyncio.gather(*[_next_earnings(s) for s in syms]),
         asyncio.to_thread(_div_info_sync, syms),
         asyncio.to_thread(_fundamentals_sync, syms),
+        asyncio.to_thread(_hist_closes_sync, syms, "year"),
     )
     today = _today_et()
     rows, within = [], 0
@@ -4913,10 +4916,21 @@ async def watchlist_radar(name: str, days: Annotated[int, Field(ge=1, le=120)] =
         soon = ((e_days is not None and e_days <= days) or (ex_days is not None and ex_days <= days))
         if soon:
             within += 1
+        tScore = mScore = None
+        exh = reb = dcx = None
+        _cl = _ordered_closes(hist, s)
+        if len(_cl) >= 35:
+            _ci = _ind_compute(_cl)
+            tScore, _ = _score_trend(_ci)
+            mScore, _ = _score_momentum(_ci)
+            _fl = _tech_flags(_ci)
+            exh, reb, dcx = bool(_fl["exhaustion"]), bool(_fl["rebound"]), _fl["death_cross"]
         rows.append({"symbol": s,
                      "nextEarnings": (e or {}).get("date"), "earningsSession": (e or {}).get("session"),
                      "earningsDaysAway": e_days, "nextExDiv": nx_ex, "exDivDaysAway": ex_days,
                      "peRatio": f.get("peRatio"), "yieldPct": f.get("dividendYieldPct"),
+                     "trendScore": tScore, "momentumScore": mScore,
+                     "exhaustion": exh, "rebound": reb, "deathCross": dcx,
                      "eventWithinWindow": soon})
 
     def _proximity(r):
@@ -4926,7 +4940,9 @@ async def watchlist_radar(name: str, days: Annotated[int, Field(ge=1, le=120)] =
     rows.sort(key=_proximity)
     return {"watchlist": name, "symbols": len(syms), "windowDays": days,
             "eventsWithinWindow": within, "radar": rows,
-            "note": "Earnings dates from RH; ex-div projected (last ex + frequency). Verify before acting."}
+            "note": "Earnings from RH; ex-div projected (last ex + frequency); trendScore/momentumScore "
+                    "(-2..+2) and exhaustion/rebound/deathCross flags from daily-bar technicals. "
+                    "Verify before acting."}
 
 
 # ---- Per-symbol earnings history (EPS actual / estimate / surprise) ----
@@ -5026,6 +5042,553 @@ async def equity_fundamentals(symbols: str) -> dict:
         return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     missing = [s for s in syms if not f.get(s)]
     return {"fundamentals": {s: v for s, v in f.items() if v}, "notFound": (missing or None)}
+
+
+# =====================================================================
+# Equity technical-read engine (local, deterministic)            v0.10.0
+# Public-domain indicator formulas: SMA-seeded EMA (adjust=False),
+# Wilder RSI-14, MACD 12/26/9, TRIX-15/9, Bollinger 20/2 (population sigma).
+# Trend + Momentum pillar scores (-2..+2) and exhaustion / bearish /
+# rebound / death-cross flags. Descriptive only -- no buy/sell verdict.
+# =====================================================================
+
+def _ind_strip(vals):
+    return [v for v in vals if v is not None]
+
+
+def _ema_series(values, period):
+    """EMA, None-padded warmup; seed = SMA of first `period` obs (adjust=False)."""
+    n = len(values)
+    out = [None] * n
+    if n < period:
+        return out
+    k = 2.0 / (period + 1)
+    prev = sum(values[:period]) / period
+    out[period - 1] = prev
+    for i in range(period, n):
+        prev = values[i] * k + prev * (1 - k)
+        out[i] = prev
+    return out
+
+
+def _rsi_wilder(close, period=14):
+    n = len(close)
+    out = [None] * n
+    if n < period + 1:
+        return out
+    gains, losses = [], []
+    for i in range(1, n):
+        ch = close[i] - close[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    def _rv(ag, al):
+        if al == 0:
+            return 100.0
+        rs = ag / al
+        return 100.0 - 100.0 / (1.0 + rs)
+
+    out[period] = _rv(avg_gain, avg_loss)
+    for i in range(period + 1, n):
+        g, l = gains[i - 1], losses[i - 1]
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
+        out[i] = _rv(avg_gain, avg_loss)
+    return out
+
+
+def _macd_calc(close, fast=12, slow=26, signal=9):
+    ef = _ema_series(close, fast)
+    es = _ema_series(close, slow)
+    line = [(a - b) if (a is not None and b is not None) else None for a, b in zip(ef, es)]
+    sig_valid = _ema_series(_ind_strip(line), signal)
+    sig = [None] * len(close)
+    first = next((i for i, v in enumerate(line) if v is not None), None)
+    if first is not None:
+        for off, v in enumerate(sig_valid):
+            sig[first + off] = v
+    hist = [(m - s) if (m is not None and s is not None) else None for m, s in zip(line, sig)]
+    return line, sig, hist
+
+
+def _trix_calc(close, period=15, signal=9):
+    n = len(close)
+    e1 = _ind_strip(_ema_series(close, period))
+    e2 = _ind_strip(_ema_series(e1, period))
+    e3 = _ind_strip(_ema_series(e2, period))
+    trix_valid = []
+    for i in range(1, len(e3)):
+        prev = e3[i - 1]
+        trix_valid.append((e3[i] - prev) / prev * 100.0 if prev != 0 else 0.0)
+    sig_valid = _ind_strip(_ema_series(trix_valid, signal))
+    t = [None] * n
+    for off, v in enumerate(trix_valid):
+        idx = n - len(trix_valid) + off
+        if idx >= 0:
+            t[idx] = v
+    s = [None] * n
+    for off, v in enumerate(sig_valid):
+        idx = n - len(sig_valid) + off
+        if idx >= 0:
+            s[idx] = v
+    return t, s
+
+
+def _bollinger_calc(close, period=20, mult=2.0):
+    if len(close) < period:
+        return None, None, None, None
+    window = close[-period:]
+    mid = sum(window) / period
+    var = sum((x - mid) ** 2 for x in window) / period   # population variance
+    sd = var ** 0.5
+    upper = mid + mult * sd
+    lower = mid - mult * sd
+    rng = upper - lower
+    pct_b = (close[-1] - lower) / rng if rng != 0 else 0.5
+    return mid, upper, lower, pct_b
+
+
+def _ind_slope(series, lookback):
+    idx = [i for i, v in enumerate(series) if v is not None]
+    if len(idx) <= lookback:
+        return None
+    return series[idx[-1]] - series[idx[-1 - lookback]]
+
+
+def _ind_r4(v):
+    return round(v, 4) if isinstance(v, float) else v
+
+
+def _ind_compute(close, slope_lookback=5):
+    warn = None
+    if len(close) < 210:
+        warn = f"Only {len(close)} bars; EMA200/some indicators may be None (ideal >=220)."
+    ema20 = _ema_series(close, 20)
+    ema50 = _ema_series(close, 50)
+    ema200 = _ema_series(close, 200)
+    rsi = _rsi_wilder(close, 14)
+    m_line, m_sig, m_hist = _macd_calc(close, 12, 26, 9)
+    t_line, t_sig = _trix_calc(close, 15, 9)
+    bb_mid, bb_up, bb_lo, pct_b = _bollinger_calc(close, 20, 2.0)
+
+    def _last(s):
+        v = _ind_strip(s)
+        return v[-1] if v else None
+
+    def _prev(s):
+        v = _ind_strip(s)
+        return v[-2] if len(v) >= 2 else None
+
+    bsb = None
+    for back in range(len(close)):
+        i = len(close) - 1 - back
+        if ema20[i] is not None and close[i] < ema20[i]:
+            bsb = back
+            break
+
+    return {
+        "n_bars": len(close), "warning": warn, "close": close[-1],
+        "ema20": _last(ema20), "ema50": _last(ema50), "ema200": _last(ema200),
+        "ema20_slope": _ind_slope(ema20, slope_lookback),
+        "ema50_slope": _ind_slope(ema50, slope_lookback),
+        "ema200_slope": _ind_slope(ema200, slope_lookback),
+        "rsi14": _last(rsi), "rsi14_prev": _prev(rsi),
+        "macd_line": _last(m_line), "macd_signal": _last(m_sig),
+        "macd_hist": _last(m_hist), "macd_hist_prev": _prev(m_hist),
+        "trix": _last(t_line), "trix_prev": _prev(t_line),
+        "trix_signal": _last(t_sig), "trix_signal_prev": _prev(t_sig),
+        "bars_since_below_ema20": bsb,
+        "bb_mid": bb_mid, "bb_upper": bb_up, "bb_lower": bb_lo, "percent_b": pct_b,
+    }
+
+
+def _score_trend(ind):
+    c = ind["close"]; e20 = ind["ema20"]; e50 = ind["ema50"]; e200 = ind["ema200"]
+    s200 = ind["ema200_slope"]
+    pts, bits = 0, []
+    if e20 is not None:
+        if c > e20: pts += 1; bits.append("price>EMA20")
+        else: pts -= 1; bits.append("price<EMA20")
+    if e20 is not None and e50 is not None:
+        if e20 > e50: pts += 1; bits.append("EMA20>EMA50")
+        else: pts -= 1; bits.append("EMA20<EMA50")
+    if e50 is not None and e200 is not None:
+        if e50 > e200: pts += 1; bits.append("EMA50>EMA200")
+        else: pts -= 1; bits.append("EMA50<EMA200")
+    if s200 is not None:
+        if s200 > 0: pts += 1; bits.append("EMA200 up")
+        else: pts -= 1; bits.append("EMA200 down")
+    score = 2 if pts >= 3 else 1 if pts >= 1 else 0 if pts == 0 else -1 if pts >= -2 else -2
+    return score, ", ".join(bits)
+
+
+def _score_momentum(ind):
+    rsi = ind["rsi14"]; hist = ind["macd_hist"]
+    trix = ind["trix"]; trix_sig = ind["trix_signal"]
+    pts, bits = 0, []
+    if rsi is not None:
+        if rsi >= 55: pts += 1; bits.append(f"RSI {rsi:.0f}>=55")
+        elif rsi <= 45: pts -= 1; bits.append(f"RSI {rsi:.0f}<=45")
+        else: bits.append(f"RSI {rsi:.0f} neutral")
+    if hist is not None:
+        if hist > 0: pts += 1; bits.append("MACD hist>0")
+        else: pts -= 1; bits.append("MACD hist<0")
+    if trix is not None and trix_sig is not None:
+        if trix > trix_sig and trix > 0: pts += 1; bits.append("TRIX>signal>0")
+        elif trix < trix_sig and trix < 0: pts -= 1; bits.append("TRIX<signal<0")
+        else: bits.append("TRIX mixed")
+    score = 2 if pts >= 2 else 1 if pts == 1 else 0 if pts == 0 else -1 if pts == -1 else -2
+    return score, ", ".join(bits)
+
+
+def _tech_flags(ind):
+    c = ind["close"]; e20 = ind["ema20"]; e50 = ind["ema50"]; e200 = ind["ema200"]
+    s200 = ind["ema200_slope"]
+    rsi, rsi_p = ind["rsi14"], ind["rsi14_prev"]
+    hist, hist_p = ind["macd_hist"], ind["macd_hist_prev"]
+    trix, trix_sig = ind["trix"], ind["trix_signal"]
+    pb = ind["percent_b"]
+    stretch = (c / e20 - 1.0) if e20 else 0.0
+    exhaustion, bearish, rebound = [], [], []
+    if rsi is not None and rsi_p is not None and rsi >= 70 and rsi < rsi_p:
+        exhaustion.append(f"RSI turning from overbought ({rsi_p:.0f}->{rsi:.0f})")
+    if hist is not None and hist_p is not None and hist > 0 and hist < hist_p:
+        exhaustion.append("MACD histogram shrinking in positive territory")
+    if pb is not None and pb >= 1.0:
+        exhaustion.append("price at/above upper Bollinger Band (%B>=1)")
+    if stretch >= 0.10:
+        exhaustion.append(f"price stretched {stretch*100:.0f}% above EMA20")
+    if e50 and e200 and s200 is not None and c < e50 and e50 < e200 and s200 < 0:
+        bearish.append("price<EMA50<EMA200 with EMA200 down")
+    if hist is not None and hist_p is not None and hist < 0 and hist < hist_p:
+        bearish.append("MACD histogram deepening in negative territory")
+    if trix is not None and trix_sig is not None and trix < trix_sig and trix < 0:
+        bearish.append("TRIX<signal below zero")
+    if rsi is not None and rsi_p is not None and rsi < 45 and rsi < rsi_p:
+        bearish.append(f"RSI weak and falling ({rsi:.0f})")
+    if rsi is not None and rsi_p is not None and rsi_p < 35 and rsi > rsi_p:
+        rebound.append(f"RSI turning from oversold ({rsi_p:.0f}->{rsi:.0f})")
+    if hist is not None and hist_p is not None and hist > hist_p and hist_p < 0:
+        rebound.append("MACD histogram crossing bullishly")
+    bsb = ind.get("bars_since_below_ema20")
+    if (e20 and c > e20 and ind["ema20_slope"] is not None and ind["ema20_slope"] > 0
+            and bsb is not None and 1 <= bsb <= 5):
+        rebound.append(f"price reclaims EMA20 (closed below {bsb} bar(s) ago)")
+    trix_p, sig_p = ind["trix_prev"], ind["trix_signal_prev"]
+    if (trix is not None and trix_sig is not None and trix_p is not None and sig_p is not None
+            and trix > trix_sig and trix_p <= sig_p and trix <= 0):
+        rebound.append("fresh bullish TRIX cross below zero")
+    death_cross = bool(e50 and e200 and e50 < e200 and c < e50)
+    return {"exhaustion": exhaustion, "bearish": bearish, "rebound": rebound,
+            "death_cross": death_cross, "stretch_pct": round(stretch * 100, 1)}
+
+
+def _tech_read(ind, t, m, flags):
+    tr = {2: "strong uptrend", 1: "uptrend", 0: "sideways",
+          -1: "downtrend", -2: "strong downtrend"}.get(t, "?")
+    mo = {2: "strong+", 1: "positive", 0: "flat", -1: "negative", -2: "strong-"}.get(m, "?")
+    parts = [f"Trend {t:+d} ({tr})", f"momentum {m:+d} ({mo})"]
+    if flags["exhaustion"]:
+        parts.append("exhaustion: " + "; ".join(flags["exhaustion"]))
+    if flags["bearish"]:
+        parts.append("bearish: " + "; ".join(flags["bearish"]))
+    if flags["rebound"]:
+        parts.append("rebound: " + "; ".join(flags["rebound"]))
+    if flags["death_cross"]:
+        parts.append("active death-cross (EMA50<EMA200, price<EMA50)")
+    return " | ".join(parts)
+
+
+def _ordered_closes(series_map, sym):
+    d = (series_map or {}).get(sym) or {}
+    return [c for _ts, c in sorted(d.items())]
+
+
+@mcp.tool()
+async def equity_technicals(symbol: str,
+                            slope_lookback: Annotated[int, Field(ge=1, le=60)] = 5) -> dict:
+    """Local, deterministic daily-bar technical read for one stock/ETF: EMA 20/50/200 structure,
+    Wilder RSI-14, MACD 12/26/9, TRIX-15, Bollinger 20/2, plus a Trend score and a Momentum score
+    (each -2..+2) and exhaustion / bearish / rebound / death-cross flags.
+
+    Computed in-process from ~1yr of Robinhood daily closes (the same bars the rest of the desk uses)
+    -- a reproducible local complement to the TradingView tools. Handy for timing a covered-call write
+    into exhaustion, spotting a rolling-over underlying before a roll, or a CSP entry on a rebound.
+    Descriptive only: it reports structure and momentum, it does NOT issue a buy/sell decision.
+    """
+    import asyncio
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return {"error": "symbol is required."}
+    try:
+        series = await asyncio.to_thread(_hist_closes_sync, [sym], "year")
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    items = sorted(((series or {}).get(sym) or {}).items())
+    if len(items) < 35:
+        return {"error": f"Not enough daily history for {sym} "
+                         f"({len(items)} bars; need ~35+ for momentum, ~220 for full EMA200)."}
+    close = [c for _ts, c in items]
+    ind = _ind_compute(close, slope_lookback)
+    t, t_detail = _score_trend(ind)
+    m, m_detail = _score_momentum(ind)
+    flags = _tech_flags(ind)
+    return {
+        "symbol": sym, "asOf": items[-1][0], "nBars": ind["n_bars"], "close": _ind_r4(ind["close"]),
+        "trend": {"score": t, "detail": t_detail},
+        "momentum": {"score": m, "detail": m_detail},
+        "indicators": {
+            "ema20": _ind_r4(ind["ema20"]), "ema50": _ind_r4(ind["ema50"]),
+            "ema200": _ind_r4(ind["ema200"]), "ema20Slope": _ind_r4(ind["ema20_slope"]),
+            "ema50Slope": _ind_r4(ind["ema50_slope"]), "ema200Slope": _ind_r4(ind["ema200_slope"]),
+            "rsi14": _ind_r4(ind["rsi14"]), "macdLine": _ind_r4(ind["macd_line"]),
+            "macdSignal": _ind_r4(ind["macd_signal"]), "macdHist": _ind_r4(ind["macd_hist"]),
+            "trix": _ind_r4(ind["trix"]), "trixSignal": _ind_r4(ind["trix_signal"]),
+            "bbMid": _ind_r4(ind["bb_mid"]), "bbUpper": _ind_r4(ind["bb_upper"]),
+            "bbLower": _ind_r4(ind["bb_lower"]), "percentB": _ind_r4(ind["percent_b"]),
+        },
+        "flags": {"exhaustion": flags["exhaustion"], "bearish": flags["bearish"],
+                  "rebound": flags["rebound"], "deathCross": flags["death_cross"],
+                  "stretchVsEma20Pct": flags["stretch_pct"]},
+        "read": _tech_read(ind, t, m, flags),
+        "warning": ind["warning"],
+        "note": "Daily-bar technicals from Robinhood historicals (SMA-seeded EMA, Wilder RSI-14, "
+                "MACD 12/26/9, TRIX-15, Bollinger 20/2 population sigma). Descriptive, not a buy/sell signal.",
+    }
+
+
+# =====================================================================
+# Cross-asset market-internals (ETF-ratio regime)               v0.10.0
+# Ported from macro_pillar.py: weighted composite of RSP/SPY, HYG/LQD,
+# IWM/SPY, SPY/TLT, XLY/XLP trend signals + 10Y-2Y curve + SPY-TLT corr.
+# Complements regime_classifier (VIX / credit / curve macro-series read).
+# =====================================================================
+_MI_WEIGHTS = {
+    "concentration": ("RSP/SPY", 0.25), "yield_curve": ("10Y-2Y", 0.20),
+    "credit": ("HYG/LQD", 0.15), "size": ("IWM/SPY", 0.15),
+    "equity_bond": ("SPY/TLT", 0.15), "sector": ("XLY/XLP", 0.10),
+}
+_MI_ETFS = ["SPY", "RSP", "IWM", "HYG", "LQD", "TLT", "XLY", "XLP"]
+
+
+def _mi_sma(series, window):
+    if len(series) < window:
+        return None
+    return sum(series[-window:]) / window
+
+
+def _mi_ratio(num, den):
+    n = min(len(num), len(den))
+    num, den = num[-n:], den[-n:]
+    return [a / b for a, b in zip(num, den) if b != 0]
+
+
+def _mi_pct_returns(series):
+    out = []
+    for i in range(1, len(series)):
+        if series[i - 1] != 0:
+            out.append(series[i] / series[i - 1] - 1.0)
+    return out
+
+
+def _mi_pearson(xs, ys):
+    n = min(len(xs), len(ys))
+    if n < 5:
+        return None
+    xs, ys = xs[-n:], ys[-n:]
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx == 0 or vy == 0:
+        return None
+    return cov / (vx ** 0.5 * vy ** 0.5)
+
+
+def _mi_trend_signal(series, fast, slow, slope_win):
+    s_slow = _mi_sma(series, slow)
+    if s_slow is None or len(series) < slow + slope_win:
+        return None, "insufficient data"
+    base = 1.0 if series[-1] > s_slow else -1.0
+    slow_then = _mi_sma(series[:-slope_win], slow)
+    if slow_then is None:
+        return None, "insufficient data for slope"
+    trend = 1.0 if s_slow > slow_then else -1.0
+    sig = 0.5 * base + 0.5 * trend
+    pos = "above" if base > 0 else "below"
+    slp = "rising" if trend > 0 else "falling"
+    return sig, f"ratio {pos} SMA{slow}, SMA{slow} {slp}"
+
+
+def _mi_component(closes_by, sym_num, sym_den, key, fast, slow, slope_win):
+    ratio_lbl, weight = _MI_WEIGHTS[key]
+    comp = {"name": key, "ratio": ratio_lbl, "weight": weight,
+            "signal": None, "detail": "", "available": True}
+    num = closes_by.get(sym_num); den = closes_by.get(sym_den)
+    if num and den:
+        sig, detail = _mi_trend_signal(_mi_ratio(num, den), fast, slow, slope_win)
+        comp["signal"], comp["detail"] = sig, detail
+    if comp["signal"] is None:
+        comp["available"] = False
+    return comp
+
+
+def _cross_asset_macro(closes_by, yield_spread=None, spread_source="none",
+                       fast=50, slow=200, slope_win=20, corr_win=40):
+    notes = []
+    comps = {}
+    comps["concentration"] = _mi_component(closes_by, "RSP", "SPY", "concentration", fast, slow, slope_win)
+
+    cyc = {"name": "yield_curve", "ratio": "10Y-2Y", "weight": _MI_WEIGHTS["yield_curve"][1],
+           "signal": None, "detail": "", "available": True}
+    spread = yield_spread
+    if spread is not None and not isinstance(spread, list):
+        spread = [spread]
+    if spread and len(spread) >= slope_win + 1:
+        spread = [float(x) for x in spread]
+        now, then = spread[-1], spread[-1 - slope_win]
+        base = 1.0 if now > 0 else -1.0
+        trend = 1.0 if now > then else -1.0
+        cyc["signal"] = 0.5 * base + 0.5 * trend
+        cyc["detail"] = f"spread {now:+.2f}, {'steepening' if trend > 0 else 'flattening'} [{spread_source}]"
+    elif spread:
+        now = float(spread[-1])
+        cyc["signal"] = 0.5 if now > 0 else -0.5
+        cyc["detail"] = f"spread {now:+.2f} (level only) [{spread_source}]"
+        notes.append("yield_spread <21 obs: level only (+/-0.5), no slope.")
+    else:
+        cyc["available"] = False
+        notes.append("No yield_spread: 20% curve weight redistributed across other components.")
+    comps["yield_curve"] = cyc
+
+    comps["credit"] = _mi_component(closes_by, "HYG", "LQD", "credit", fast, slow, slope_win)
+    comps["size"] = _mi_component(closes_by, "IWM", "SPY", "size", fast, slow, slope_win)
+    comps["equity_bond"] = _mi_component(closes_by, "SPY", "TLT", "equity_bond", fast, slow, slope_win)
+    comps["sector"] = _mi_component(closes_by, "XLY", "XLP", "sector", fast, slow, slope_win)
+
+    spy = closes_by.get("SPY"); tlt = closes_by.get("TLT")
+    spy_tlt_corr = None
+    if spy and tlt:
+        rs = _mi_pct_returns(spy[-(corr_win + 1):])
+        rt = _mi_pct_returns(tlt[-(corr_win + 1):])
+        spy_tlt_corr = _mi_pearson(rs, rt)
+
+    avail = [c for c in comps.values() if c["available"] and c["signal"] is not None]
+    if not avail:
+        raise EdgeError("No cross-asset components with sufficient data.")
+    wsum = sum(c["weight"] for c in avail)
+    composite = sum(c["signal"] * c["weight"] for c in avail) / wsum
+    composite = max(-1.0, min(1.0, composite))
+
+    eb = comps["equity_bond"]
+    inflationary = bool(spy_tlt_corr is not None and spy_tlt_corr > 0.25
+                        and eb["available"] and eb["signal"] is not None and eb["signal"] <= 0)
+
+    rsp_sig = comps["concentration"]["signal"] or 0
+    iwm_sig = comps["size"]["signal"] or 0
+    cr_sig = comps["credit"]["signal"] or 0
+    if inflationary:
+        regime = "Inflationary"
+    elif composite <= -0.5 and cr_sig < 0:
+        regime = "Contraction"
+    elif composite >= 0.4 and iwm_sig > 0:
+        regime = "Broadening"
+    elif rsp_sig < 0 and iwm_sig < 0 and composite > -0.5:
+        regime = "Concentration"
+    else:
+        regime = "Transitional"
+
+    if composite >= 0.5:
+        pillar, plabel = 2, "Strongly favorable macro"
+    elif composite >= 0.2:
+        pillar, plabel = 1, "Favorable macro"
+    elif composite > -0.2:
+        pillar, plabel = 0, "Neutral macro"
+    elif composite > -0.5:
+        pillar, plabel = -1, "Adverse macro"
+    else:
+        pillar, plabel = -2, "Strongly adverse macro"
+    if regime in ("Contraction", "Inflationary") and pillar > -1:
+        pillar = -1
+        plabel = f"Adverse macro (cap due to {regime} regime)"
+        notes.append(f"Pillar capped at -1 due to {regime} regime.")
+
+    return {"composite": round(composite, 3), "regime": regime, "pillarScore": pillar,
+            "pillarLabel": plabel, "inflationaryFlag": inflationary,
+            "spyTltCorr": round(spy_tlt_corr, 3) if spy_tlt_corr is not None else None,
+            "components": [{"ratio": c["ratio"], "weight": c["weight"],
+                            "signal": round(c["signal"], 2) if c["signal"] is not None else None,
+                            "detail": c["detail"], "available": c["available"]}
+                           for c in comps.values()],
+            "notes": notes}
+
+
+def _mi_yield_spread_sync():
+    """(spread, source, latest): prefer FRED T10Y2Y series (slope-capable), then DGS10-DGS2 level."""
+    try:
+        rows = _fetch_series("T10Y2Y", start=_recent_window(180))
+        vals = [v for _d, v in rows]
+        if len(vals) >= 21:
+            return vals, "FRED T10Y2Y", vals[-1]
+        if vals:
+            return vals[-1], "FRED T10Y2Y (level)", vals[-1]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ten = _latest_obs("DGS10"); two = _latest_obs("DGS2")
+        if ten and two:
+            sp = round(float(ten[1]) - float(two[1]), 3)
+            return sp, "FRED DGS10-DGS2 (level)", sp
+    except Exception:  # noqa: BLE001
+        pass
+    return None, "unavailable", None
+
+
+@mcp.tool()
+async def market_internals(yield_spread: Optional[float] = None) -> dict:
+    """Cross-asset market-internals regime from daily ETF-ratio trends: concentration (RSP/SPY),
+    credit (HYG/LQD), size (IWM/SPY), equity-vs-bond (SPY/TLT), sector rotation (XLY/XLP), plus the
+    10Y-2Y curve and the rolling SPY-TLT return correlation. Returns a weighted composite (-1..+1), a
+    Macro-Sentiment pillar (-2..+2), a regime label (Broadening / Concentration / Contraction /
+    Inflationary / Transitional), and an inflationary flag.
+
+    A price-based internals lens that complements `regime_classifier` (which reads VIX term-structure
+    and macro series). ETF closes come from ~1yr of Robinhood daily historicals. The 2s10s spread is
+    auto-filled from FRED (T10Y2Y) when `yield_spread` is omitted; if neither is available its 20%
+    weight is redistributed across the other components.
+    """
+    import asyncio
+    try:
+        closes_by = await asyncio.to_thread(_hist_closes_sync, _MI_ETFS, "year")
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    if yield_spread is not None:
+        spread, spread_source, spread_latest = yield_spread, "caller", yield_spread
+    else:
+        try:
+            spread, spread_source, spread_latest = await asyncio.to_thread(_mi_yield_spread_sync)
+        except Exception:  # noqa: BLE001
+            spread, spread_source, spread_latest = None, "unavailable", None
+    closes_map = {s: _ordered_closes(closes_by, s) for s in _MI_ETFS}
+    try:
+        res = await asyncio.to_thread(_cross_asset_macro, closes_map, spread, spread_source)
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    res["asOf"] = _today_et().isoformat()
+    res["yieldSpread"] = spread_latest
+    res["yieldSpreadSource"] = spread_source
+    res["note"] = ("Cross-asset internals from daily ETF-ratio trends (RSP/SPY, HYG/LQD, IWM/SPY, "
+                   "SPY/TLT, XLY/XLP) + 2s10s + SPY-TLT corr. Complements regime_classifier; ETF "
+                   "closes from Robinhood historicals. Not investment advice.")
+    return res
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ implied vol, with proper Eastern-time time-to-expiry so 0DTE gamma stays realist
 > **Data is ~15 minutes delayed** (CBOE delayed quotes). That is fine for *positioning and regime*.
 > Overlay a live broker quote (e.g. Robinhood/E\*TRADE/Alpaca MCP) for execution pricing.
 
-## Tools (68)
+## Tools (70)
 
 ### Chain & Greeks
 | Tool | What it does |
@@ -183,9 +183,15 @@ key="daily_target", value="550")`. Editable keys: `daily_target`, `weekly_target
 |------|--------------|
 | `realized_pnl` | Authoritative realized-P&L check: reconciles the FIFO reconstruction (`daily_pnl_curve` / `tax_summary`) against a fee-inclusive round-trip figure and, when `RH_PNL_HUB_URL` is set, Robinhood's official PnL-hub payload. The reconciliation block isolates fees, expiries/assignments, and unpaired open legs. |
 | `index_quote` | Live SPX / VIX / NDX index levels from Robinhood marketdata -- a real-time print to de-stale the ~15-min CBOE chain and calibrate the SPY->SPX basis. Endpoint pinnable via `RH_INDEX_QUOTE_URL`. |
-| `watchlist_radar` | Catalyst radar across a named Robinhood watchlist: next earnings (BMO/AMC) and projected next ex-dividend per name, flagged within a window, plus P/E and yield, ranked by nearest event. |
+| `watchlist_radar` | Catalyst radar across a named Robinhood watchlist: next earnings (BMO/AMC) and projected next ex-dividend per name, flagged within a window, plus P/E and yield, ranked by nearest event. Also folds in per-symbol technicals (trend/momentum scores + exhaustion/rebound/death-cross flags) from a shared 1y history batch. |
 | `earnings_results` | Per-symbol trailing earnings: EPS actual vs estimate, surprise ($ and %), report date and timing, ~8 quarters. |
 | `equity_fundamentals` | Per-symbol snapshot: P/E, P/B, market cap, shares, dividend yield, 52-week range, sector/industry, and a short profile; up to 10 symbols. |
+
+### Technical engine (v0.10.0)
+| Tool | What it does |
+|------|--------------|
+| `equity_technicals` | Local, deterministic per-stock trend/momentum read: ~1y daily closes -> EMA(20/50/200)+slopes, RSI-14 (Wilder), MACD(12/26/9), TRIX(15/9), Bollinger(20,2)+%B, a Trend score and Momentum score (each -2..+2), and flags (exhaustion, bearish, rebound, death cross, stretch-vs-EMA20). Descriptive only -- no buy/sell call. |
+| `market_internals` | Cross-asset regime read from 8 ETFs (SPY, RSP, IWM, HYG, LQD, TLT, XLY, XLP) with the 2s10s spread auto-filled from FRED (`T10Y2Y`, fallback `DGS10 - DGS2`): composite (-1..+1), pillar score (-2..+2), regime label, inflationary flag, and SPY/TLT correlation. Complements `regime_classifier`. |
 
 ## Data sources
 

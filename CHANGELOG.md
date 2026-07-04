@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [0.10.0] - 2026-07-03
+
+### Added — 2 tools (68 -> 70), local technical engine
+
+**Per-stock technical read**
+- **`equity_technicals`** — local, deterministic per-stock trend/momentum engine. Pulls ~1y of daily
+  closes from Robinhood and computes EMA(20/50/200) + slopes, RSI-14 (Wilder), MACD(12/26/9),
+  TRIX(15/9), and Bollinger(20,2) + %B, then folds them into a **Trend** score and a **Momentum**
+  score (each -2..+2) plus flags (exhaustion, bearish, rebound, death cross, stretch-vs-EMA20).
+  Descriptive only — no buy/sell prescription. Needs >=35 bars. Indicator math is a clean-room
+  reimplementation of public-domain formulas, validated bit-for-bit against a reference.
+
+**Cross-asset regime**
+- **`market_internals`** — cross-asset regime read (macro-pillar port). Uses 8 ETFs
+  (SPY, RSP, IWM, HYG, LQD, TLT, XLY, XLP) with the 2s10s spread auto-filled from FRED (`T10Y2Y`,
+  falling back to `DGS10 - DGS2`, else redistributing that component's weight). Returns a composite
+  (-1..+1), pillar score (-2..+2), regime label, inflationary flag, SPY/TLT correlation, and
+  per-component detail. Complements `regime_classifier` rather than replacing it.
+
+### Changed
+- **`watchlist_radar`** — now computes per-symbol technicals from the same 1y history batch and adds
+  `trendScore`, `momentumScore`, `exhaustion`, `rebound`, and `deathCross` to each row, so a saved
+  list is scanned for technical posture alongside earnings/ex-div catalysts in one pass.
+
 ## [0.9.0] - 2026-07-03
 
 ### Added — 5 tools (63 -> 68), Robinhood-native
