@@ -70,6 +70,27 @@ VOL_INDICES = [
 RISK_FREE = float(os.environ.get("TE_RISK_FREE", "0.043"))   # annualized; gamma is ~insensitive
 CONTRACT_MULT = 100                                          # index option contract multiplier
 ET = ZoneInfo("America/New_York")
+
+# ---- NYSE trading calendar (B8) --------------------------------------------
+# Holidays close the market entirely; half days close at 13:00 ET. Static per-year
+# (same pattern as _FOMC_2026); extend each January. 2026-07-03 is the observed
+# Independence Day holiday (Jul 4 falls on Saturday), so there is no July half day.
+_NYSE_HOLIDAYS_2026 = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+}
+_NYSE_HALF_DAYS_2026 = {"2026-11-27", "2026-12-24"}   # 13:00 ET close
+
+
+def _session_close_et(d: _dt.date) -> _dt.time:
+    """Cash-session close for a date: 13:00 ET on half days, else 16:00 ET."""
+    return _dt.time(13, 0) if d.isoformat() in _NYSE_HALF_DAYS_2026 else _dt.time(16, 0)
+
+
+def _is_trading_day(d: _dt.date) -> bool:
+    return d.weekday() < 5 and d.isoformat() not in _NYSE_HOLIDAYS_2026
+
+
 CHAIN_TTL = 90.0          # seconds to cache the (large) CBOE chain pull (cash session open)
 CHAIN_TTL_CLOSED = 1800.0 # when the session is closed the chain is static; refetch far less often
 QUOTE_TTL = 60.0
@@ -102,7 +123,26 @@ class EdgeError(Exception):
     pass
 
 
-_cache: dict = {}
+class _TTLCache(dict):
+    """(#7) One place for the (payload, monotonic_ts) + FIFO-bound pattern that was hand-rolled per
+    cache. Callers keep their own tuple values and check the TTL at read time; put() just caps memory
+    so a long-lived process can't grow its URL / series caches without bound. The single-slot broker
+    caches (_rh_cache, _et_cache, _tt_cache, ...) are already bounded and intentionally don't use this."""
+    def __init__(self, maxsize: int = 256):
+        super().__init__()
+        self._maxsize = int(maxsize)
+
+    def put(self, key, value) -> None:
+        self.pop(key, None)
+        self[key] = value
+        while len(self) > self._maxsize:
+            oldest = next(iter(self))
+            if oldest == key:
+                break
+            self.pop(oldest, None)
+
+
+_cache: "_TTLCache" = _TTLCache(512)   # URL responses + parsed-chain + rhchain:<expiry> entries
 
 
 async def _async_sleep(secs: float) -> None:
@@ -110,28 +150,48 @@ async def _async_sleep(secs: float) -> None:
     await asyncio.sleep(secs)
 
 
+def _redact_url(url: str) -> str:
+    """B12: strip API-key-bearing query values before a URL lands in an error message or log."""
+    import re
+    return re.sub(r"(?i)((?:api_?key|apikey|token|key)=)[^&]+", r"\g<1>***", url or "")
+
+
+def _cache_put(cache: dict, key, value, max_entries: int = 256) -> None:
+    """B15: bounded insert (FIFO eviction by insertion order) so a long-lived process can't grow
+    its URL/series caches without limit."""
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > max_entries:
+        oldest = next(iter(cache))
+        if oldest == key:
+            break
+        cache.pop(oldest, None)
+
+
 async def _get_json(url: str, ttl: float) -> Any:
     hit = _cache.get(url)
     if hit and (time.monotonic() - hit[1]) < ttl:
         return hit[0]
     last = None
-    for _ in range(3):
+    r = None
+    for attempt in range(3):
         try:
             r = await _get_client().get(url)
             break
         except Exception as exc:  # noqa: BLE001 (transient disconnects; retry)
             last = exc
-            await _async_sleep(1.2)
-    else:
-        raise EdgeError(f"Request failed: {url} ({last})")
+            if attempt < 2:                # B15: no pointless sleep before the final raise
+                await _async_sleep(1.2)
+    if r is None:
+        raise EdgeError(f"Request failed: {_redact_url(url)} ({last})")
     if r.status_code == 404:
-        raise EdgeError(f"Not found (404): {url}")
+        raise EdgeError(f"Not found (404): {_redact_url(url)}")
     try:
         r.raise_for_status()
         data = r.json()
     except Exception as exc:  # noqa: BLE001
-        raise EdgeError(f"Bad response from {url}: {str(exc)[:160]}") from exc
-    _cache[url] = (data, time.monotonic())
+        raise EdgeError(f"Bad response from {_redact_url(url)}: {str(exc)[:160]}") from exc
+    _cache.put(url, (data, time.monotonic()))
     return data
 
 
@@ -160,12 +220,13 @@ def _today_et() -> _dt.date:
 
 
 def _year_frac(expiry: str) -> float:
-    """Years from 'now' (ET) to 16:00 ET on the expiration date; floored so 0DTE gamma stays finite."""
+    """Years from 'now' (ET) to the session close on the expiration date (16:00 ET; 13:00 on
+    half days -- B8), floored so 0DTE gamma stays finite."""
     try:
         ed = _dt.date.fromisoformat(expiry)
     except ValueError:
         return 1.0 / 365.0
-    expiry_dt = _dt.datetime.combine(ed, _dt.time(16, 0), tzinfo=ET)
+    expiry_dt = _dt.datetime.combine(ed, _session_close_et(ed), tzinfo=ET)
     now = _dt.datetime.now(ET)
     secs = (expiry_dt - now).total_seconds()
     floor = 0.5 / (365.0 * 24.0)        # ~30 minutes, avoids gamma blow-up at the bell
@@ -368,7 +429,10 @@ def _rh_chain_sync(expiry: str) -> dict:
         mark = _rh_sf(m.get("mark_price") or m.get("adjusted_mark_price"))
         mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else mark
         options.append({
-            "symbol": c.get("id"), "root": "SPXW", "expiry": expiry, "cp": cp, "strike": K,
+            # B3: real OCC symbol so RH-served rows match option_quote lookups and the CBOE row
+            # shape; the RH instrument UUID is preserved under rhId.
+            "symbol": _occ_symbol("SPXW", expiry, cp, K), "rhId": c.get("id"),
+            "root": "SPXW", "expiry": expiry, "cp": cp, "strike": K,
             "bid": bid, "ask": ask, "mid": mid, "iv": _rh_sf(m.get("implied_volatility")),
             "oi": _rh_sf(m.get("open_interest")), "volume": _rh_sf(m.get("volume")),
             "last": _rh_sf(m.get("last_trade_price")), "delta": _rh_sf(m.get("delta")),
@@ -398,6 +462,47 @@ def _rh_chain_sync(expiry: str) -> dict:
             "source": "robinhood_live", "freshness": fresh}
 
 
+async def _rh_chain_cached(expiry: str) -> Optional[dict]:
+    """Cached _rh_chain_sync for ONE expiry. Returns None (rather than raising) when RH has no
+    contracts for that date, so callers can fall through to another expiry."""
+    import asyncio
+    hit = _cache.get(f"rhchain:{expiry}")
+    if hit and (time.monotonic() - hit[1]) < RH_CHAIN_TTL:
+        return hit[0]
+    try:
+        ch = await asyncio.to_thread(_rh_chain_sync, expiry)
+    except EdgeError as exc:
+        log.info("RH has no chain for %s (%s)", expiry, str(exc)[:120])
+        return None
+    _cache.put(f"rhchain:{expiry}", (ch, time.monotonic()))
+    return ch
+
+
+async def _maybe_merge_spx(rh_ch: dict, expiry: str, root: str) -> dict:
+    """B10: the RH feed carries ONLY the SPXW book. For root='ALL' on a date where AM-settled SPX
+    monthlies also trade (OpEx), merge the CBOE SPX rows for that expiry so GEX/walls don't
+    silently lose the monthly open interest. CBOE failure degrades to RH-only with a warning."""
+    if root.upper() != "ALL":
+        return rh_ch
+    try:
+        cboe = await _load_chain()
+    except EdgeError:
+        rh_ch = dict(rh_ch)
+        fr = dict(rh_ch.get("freshness") or {})
+        fr["spxMergeWarning"] = "root=ALL requested but CBOE unavailable; SPX (AM-settled) legs missing."
+        rh_ch["freshness"] = fr
+        return rh_ch
+    spx_rows = [o for o in (cboe.get("options") or [])
+                if o.get("root") == "SPX" and o.get("expiry") == expiry]
+    if spx_rows:
+        rh_ch = dict(rh_ch)
+        rh_ch["options"] = list(rh_ch["options"]) + spx_rows
+        fr = dict(rh_ch.get("freshness") or {})
+        fr["spxMergedFromCBOE"] = len(spx_rows)
+        rh_ch["freshness"] = fr
+    return rh_ch
+
+
 async def _load_chain_smart(zero_dte: bool = False, expiration: Optional[str] = None,
                             root: str = "SPXW", prefer_rh: bool = True) -> dict:
     """Chain feed for the 0DTE tools: Robinhood live = PRIMARY, CBOE delayed = stale-flagged
@@ -407,21 +512,29 @@ async def _load_chain_smart(zero_dte: bool = False, expiration: Optional[str] = 
     single = bool(zero_dte or expiration)
     if prefer_rh and single and root.upper() in ("SPXW", "ALL"):
         try:
-            exps = await asyncio.to_thread(_rh_expiries_sync)
             today = _today_et().isoformat()
-            if expiration:
-                target = expiration
-            elif zero_dte:
-                target = today if today in exps else next((e for e in exps if e >= today), None)
-            else:
-                target = None
+            # NEVER gate 0DTE on _rh_expiries_sync(). RH's chain-level `expiration_dates` lists
+            # openable FUTURE expiries and intermittently omits the same-day one -- verified
+            # 2026-07-16: 12/12 calls returned 40 expiries starting 2026-07-17, with today
+            # absent, while _rh_chain_sync(today) served 476 live contracts for that same date.
+            # Gating on it silently rolled the whole 0DTE map (flip, walls, max pain, expected
+            # move) onto TOMORROW's book while still reporting freshness "live". _rh_chain_sync
+            # filters instruments by expiration_dates= directly, so just ask for today and only
+            # go looking for another expiry if that genuinely comes back empty.
+            target = expiration or (today if zero_dte else None)
             if target:
-                hit = _cache.get(f"rhchain:{target}")
-                if hit and (time.monotonic() - hit[1]) < RH_CHAIN_TTL:
-                    return hit[0]
-                rh_ch = await asyncio.to_thread(_rh_chain_sync, target)
-                _cache[f"rhchain:{target}"] = (rh_ch, time.monotonic())
-                return rh_ch
+                rh_ch = await _rh_chain_cached(target)
+                if rh_ch is not None:
+                    return await _maybe_merge_spx(rh_ch, target, root)
+            if zero_dte and not expiration:
+                # Today really has no contracts (holiday / series rolled off) -- now, and only
+                # now, ask RH what the next real expiry is.
+                exps = await asyncio.to_thread(_rh_expiries_sync)
+                nxt = next((e for e in exps if e > today), None)
+                if nxt:
+                    rh_ch = await _rh_chain_cached(nxt)
+                    if rh_ch is not None:
+                        return await _maybe_merge_spx(rh_ch, nxt, root)
         except Exception as exc:  # noqa: BLE001 -- any RH failure falls back to CBOE
             log.info("RH chain unavailable (%s); falling back to CBOE delayed", str(exc)[:140])
     ch = dict(await _load_chain())
@@ -483,7 +596,8 @@ async def expirations(
     for e in exps[:limit]:
         dte = (_dt.date.fromisoformat(e) - today).days
         rows.append({"expiration": e, "dte": dte, "zeroDTE": dte == 0})
-    return {"root": rootU, "spot": round(ch["spot"], 2), "count": len(rows), "expirations": rows}
+    return {"root": rootU, "spot": round(ch["spot"], 2), "count": len(rows), "expirations": rows,
+            "source": "cboe_delayed", "freshness": _staleness(ch.get("asof"))}
 
 
 @mcp.tool()
@@ -502,7 +616,8 @@ async def options_chain(
     recomputed analytically from each contract's IV and time-to-expiry.
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=zero_dte,     # B3: RH-live primary for 0DTE work
+                                     expiration=(None if zero_dte else expiration), root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
@@ -536,6 +651,7 @@ async def options_chain(
         })
     resolved = "today" if zero_dte else exp
     return {"root": root.upper(), "expiration": resolved, "spot": round(spot, 2),
+            "source": ch.get("source"), "freshness": ch.get("freshness"),
             "strikes": len(out), "chain": out}
 
 
@@ -550,21 +666,27 @@ async def option_quote(symbol: str) -> dict:
     parsed = _parse_occ(sym)
     if not parsed:
         return {"error": f"Could not parse OCC symbol '{symbol}'."}
+    root, expiry, cp, strike = parsed
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(expiration=expiry, root=root)   # B3: RH-live for SPXW
     except EdgeError as exc:
         return {"error": str(exc)}
-    o = next((x for x in ch["options"] if (x["symbol"] or "").upper() == sym), None)
+    o = next((x for x in ch["options"] if (x.get("symbol") or "").upper() == sym), None)
+    if o is None:
+        # Terms-based fallback: feed rows can differ cosmetically from the OCC string.
+        o = next((x for x in ch["options"]
+                  if x.get("root") == root and x.get("cp") == cp and x.get("expiry") == expiry
+                  and abs((x.get("strike") or 0.0) - strike) < 1e-6), None)
     if not o:
         return {"error": f"{sym} not found in the current SPX chain."}
-    root, expiry, cp, strike = parsed
     spot = ch["spot"]
     T = _year_frac(expiry)
     detail = {"symbol": sym, "root": root, "type": cp, "strike": strike, "expiration": expiry,
               "dte": (_dt.date.fromisoformat(expiry) - _today_et()).days,
               "spot": round(spot, 2), "bid": o["bid"], "ask": o["ask"], "mid": round(o["mid"], 2),
               "last": o["last"], "iv": round(o["iv"], 4) if o["iv"] else None,
-              "openInterest": int(o["oi"]), "volume": int(o["volume"])}
+              "openInterest": int(o["oi"]), "volume": int(o["volume"]),
+              "source": ch.get("source"), "freshness": ch.get("freshness")}
     if o["iv"] > 0 and T > 0:
         K = np.array([strike]); isc = np.array([cp == "C"])
         d, g, vn, cm = _greeks_vec(spot, K, np.array([T]), np.array([o["iv"]]), isc)
@@ -668,6 +790,8 @@ async def gamma_exposure(
     mean-reverting tape); negative => short gamma (moves get amplified). The flip is the spot level where
     net dealer gamma crosses zero. Units: $ per 1% move. ~15-min delayed.
     """
+    if zero_dte and expiration:   # B10: was silently discarding the expiration
+        return {"error": "Pass either zero_dte=True or an explicit expiration, not both."}
     try:
         ch = await _load_chain_smart(zero_dte=zero_dte, expiration=(None if zero_dte else expiration), root=root)
     except EdgeError as exc:
@@ -707,12 +831,20 @@ async def gamma_walls(
     often cushions selloffs. Max-pain is the strike that minimizes total option-holder payout.
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=zero_dte,     # B3: RH-live primary, was CBOE-only
+                                     expiration=(None if zero_dte else expiration), root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
     exp = None if zero_dte else (expiration or _nearest_expiry(ch["options"], root))
     opts = _filter(ch["options"], root=root, expiration=exp, zero_dte=zero_dte)
+    note = None
+    resolved = "today" if zero_dte else exp
+    if zero_dte and not opts:
+        exp = _nearest_expiry(ch["options"], root)
+        opts = _filter(ch["options"], root=root, expiration=exp)
+        resolved = exp
+        note = f"No contracts expire today; showing nearest expiry {exp}."
     comp = _gex_components(spot, opts)
     if not comp:
         return {"error": "No valid contracts (need OI and IV) for that selection."}
@@ -724,14 +856,17 @@ async def gamma_walls(
     put_wall = max(put_below.items(), key=lambda kv: kv[1]) if put_below else (
         max(put.items(), key=lambda kv: kv[1]) if put else None)
     top_abs = sorted(net.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top]
-    resolved = "today" if zero_dte else exp
-    return {
+    out = {
         "root": root.upper(), "expiration": resolved, "spot": round(spot, 2),
+        "asof": ch.get("asof"), "source": ch.get("source"), "freshness": ch.get("freshness"),
         "callWall": ({"strike": call_wall[0], "gamma_$mm": _mm(call_wall[1])} if call_wall else None),
         "putWall": ({"strike": put_wall[0], "gamma_$mm": _mm(put_wall[1])} if put_wall else None),
         "maxPain": _max_pain(opts),
         "topGammaStrikes": [{"strike": k, "netGamma_$mm": _mm(v)} for k, v in top_abs],
     }
+    if note:
+        out["note"] = note
+    return out
 
 
 @mcp.tool()
@@ -799,12 +934,18 @@ async def dealer_exposure(
     convention as GEX: calls add, puts subtract.
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=zero_dte,     # B3: RH-live primary, was CBOE-only
+                                     expiration=(None if zero_dte else expiration), root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
     exp = None if (zero_dte or not expiration) else expiration
     opts = _filter(ch["options"], root=root, expiration=exp, zero_dte=zero_dte)
+    scope = "today" if zero_dte else (exp or "all expirations")
+    if zero_dte and not opts:
+        nxt = _nearest_expiry(ch["options"], root)
+        opts = _filter(ch["options"], root=root, expiration=nxt)
+        scope = f"{nxt} (nothing expires today)"
     K, isc, oi, iv, T = _arrays(opts)
     m = _valid_mask(K, oi, iv, T)
     if not m.any():
@@ -816,9 +957,9 @@ async def dealer_exposure(
     dex = float((sign * delta * notional * spot).sum())
     vex = float((sign * vanna * notional * spot * 0.01).sum())     # per 1% vol
     chex = float((sign * charm * notional * spot / 365.0).sum())   # per day
-    scope = "today" if zero_dte else (exp or "all expirations")
     return {
         "root": root.upper(), "scope": scope, "spot": round(spot, 2), "asof": ch.get("asof"),
+        "source": ch.get("source"), "freshness": ch.get("freshness"),
         "dealerDelta_DEX_$mm": _mm(dex),
         "dealerDelta_interpretation": ("net long delta (dealers sell futures into strength)"
                                        if dex > 0 else "net short delta (dealers buy futures into weakness)"),
@@ -910,22 +1051,26 @@ async def vix_term_structure() -> dict:
 _FOMC_2026 = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
               "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"]
 
-# Best-effort scheduled US macro for 2026 (8:30 ET unless noted). Verify exact dates for tick-precision;
-# set FMP_API_KEY or FINNHUB_API_KEY for a fully live calendar.
+# LAST-RESORT FALLBACK ONLY -- these are GUESSES, not confirmed release dates, and they HAVE
+# been wrong. Reality check run 2026-07-15 against live actuals: this table had CPI(June) on
+# 07-15 (actual 07-14) and PPI(June) on 07-16 (actual 07-15) -- both off by a full day, which
+# produced a bad 0DTE session plan. Entries marked [v] are now verified against printed actuals;
+# the rest remain unverified. _fetch_tv_calendar (keyless, live) should make this unreachable.
 _CURATED_2026 = [
     ("2026-06-25", "08:30", "GDP (Q1 final)", "medium"),
     ("2026-06-26", "08:30", "PCE Price Index (May)", "high"),
-    ("2026-07-15", "08:30", "CPI (June)", "high"),
-    ("2026-07-16", "08:30", "PPI (June)", "medium"),
-    ("2026-07-16", "08:30", "Retail Sales (June)", "high"),
-    ("2026-07-31", "08:30", "PCE Price Index (June)", "high"),
-    ("2026-08-12", "08:30", "CPI (July)", "high"),
-    ("2026-08-14", "08:30", "Retail Sales (July)", "high"),
-    ("2026-09-11", "08:30", "CPI (August)", "high"),
-    ("2026-09-16", "08:30", "Retail Sales (August)", "high"),
-    ("2026-10-14", "08:30", "CPI (September)", "high"),
-    ("2026-11-13", "08:30", "CPI (October)", "high"),
-    ("2026-12-10", "08:30", "CPI (November)", "high"),
+    ("2026-07-14", "08:30", "CPI (June)", "high"),               # [v] corrected, was 07-15
+    ("2026-07-15", "08:30", "PPI (June)", "medium"),             # [v] corrected, was 07-16
+    ("2026-07-16", "08:30", "Retail Sales (June)", "high"),      # [v]
+    ("2026-07-30", "08:30", "PCE Price Index (June)", "high"),   # [v] corrected, was 07-31
+    ("2026-08-12", "08:30", "CPI (July)", "high"),               # [v]
+    ("2026-08-13", "08:30", "PPI (July)", "medium"),             # [v] added
+    ("2026-08-14", "08:30", "Retail Sales (July)", "high"),      # [v]
+    ("2026-09-11", "08:30", "CPI (August)", "high"),             # UNVERIFIED
+    ("2026-09-16", "08:30", "Retail Sales (August)", "high"),    # UNVERIFIED
+    ("2026-10-14", "08:30", "CPI (September)", "high"),          # UNVERIFIED
+    ("2026-11-13", "08:30", "CPI (October)", "high"),            # UNVERIFIED
+    ("2026-12-10", "08:30", "CPI (November)", "high"),           # UNVERIFIED
 ]
 
 
@@ -977,6 +1122,51 @@ async def _treasury_auctions(start: _dt.date, end: _dt.date) -> list:
     return out
 
 
+TV_CALENDAR_URL = "https://economic-calendar.tradingview.com/events"
+TV_CALENDAR_HEADERS = {"Origin": "https://www.tradingview.com",
+                       "Referer": "https://www.tradingview.com/"}
+_TV_IMPORTANCE = {1: "high", 0: "medium", -1: "low"}
+
+
+async def _fetch_tv_calendar(start: _dt.date, end: _dt.date) -> Optional[list]:
+    """Live US macro calendar from TradingView's public economic-calendar endpoint. NO KEY NEEDED.
+
+    Unofficial/undocumented, but keyless and tick-accurate: real release dates with
+    actual/forecast/previous. This is the same source the tradingview MCP uses. Any failure
+    returns None so the caller falls back to FMP/Finnhub/curated.
+    """
+    url = (f"{TV_CALENDAR_URL}?from={start.isoformat()}T00:00:00.000Z"
+           f"&to={end.isoformat()}T23:59:59.000Z&countries=US&minImportance=0")
+    try:
+        r = await _get_client().get(url, headers=TV_CALENDAR_HEADERS)
+        r.raise_for_status()
+        raw = r.json()
+    except Exception as exc:  # noqa: BLE001 -- any failure falls back to the next source
+        log.info("TradingView calendar unavailable (%s); falling back", str(exc)[:140])
+        return None
+    rows = raw.get("result") if isinstance(raw, dict) else raw
+    if not isinstance(rows, list) or not rows:
+        return None
+    out = []
+    for ev in rows:
+        ds = ev.get("date") or ""
+        try:
+            when = _dt.datetime.fromisoformat(ds.replace("Z", "+00:00")).astimezone(ET)
+        except Exception:  # noqa: BLE001
+            continue
+        name = ev.get("title") or ev.get("indicator") or ""
+        if not name:
+            continue
+        period = ev.get("period")
+        out.append({"date": when.date().isoformat(), "time": when.strftime("%H:%M"),
+                    "name": (f"{name} ({period})" if period else name),
+                    "importance": _TV_IMPORTANCE.get(ev.get("importance"), "medium"),
+                    "source": "TradingView (live)",
+                    "actual": ev.get("actual"), "forecast": ev.get("forecast"),
+                    "previous": ev.get("previous")})
+    return out or None
+
+
 async def _fetch_live_calendar(start: _dt.date, end: _dt.date) -> Optional[list]:
     fmp = os.environ.get("FMP_API_KEY")
     fin = os.environ.get("FINNHUB_API_KEY")
@@ -1016,7 +1206,9 @@ async def _fetch_live_calendar(start: _dt.date, end: _dt.date) -> Optional[list]
             out.append({"date": t[:10], "time": (t[11:16] if len(t) >= 16 else ""),
                         "name": ev.get("event", ""), "importance": imp, "source": "Finnhub (live)"})
         return out
-    return None
+    # No key set: TradingView's keyless endpoint is still a LIVE source. Only if that fails
+    # does the caller drop to the curated guess table.
+    return await _fetch_tv_calendar(start, end)
 
 
 def _build_events(start: _dt.date, end: _dt.date) -> list:
@@ -1064,10 +1256,29 @@ async def economic_calendar(
     start = _today_et()
     end = start + _dt.timedelta(days=days)
     live = await _fetch_live_calendar(start, end)
+    curated_drift = None
     if live is not None:
-        events, src = live, "live API"
+        events = live
+        src = (live[0].get("source") if live else "live")
+        # (#11a) Self-verify the hand-maintained curated table against the live feed while we have it:
+        # match by event name and flag any curated date that disagrees, so _build_events can be
+        # corrected instead of silently drifting (you've been doing this by hand with [v] markers).
+        try:
+            live_by_name = {}
+            for _e in live:
+                live_by_name.setdefault((_e.get("name") or "").strip().lower(), _e.get("date"))
+            drift = []
+            for _c in _build_events(start, end):
+                _lv = live_by_name.get((_c.get("name") or "").strip().lower())
+                if _lv and _c.get("date") and _lv != _c["date"]:
+                    drift.append({"event": _c.get("name"), "curatedDate": _c["date"], "liveDate": _lv})
+            if drift:
+                curated_drift = drift
+                log.warning("economic_calendar: curated table drift vs live feed: %s", drift)
+        except Exception:  # noqa: BLE001
+            pass
     else:
-        events, src = _build_events(start, end), "curated + rules (no API key set)"
+        events, src = _build_events(start, end), "curated + rules (UNVERIFIED GUESSES)"
     events = events + await _treasury_auctions(start, end)
     imp = importance.lower()
     if imp in ("high", "medium"):
@@ -1076,8 +1287,16 @@ async def economic_calendar(
     events.sort(key=lambda e: (e["date"], e.get("time", "")))
     out = {"window": {"from": start.isoformat(), "to": end.isoformat()},
            "source": src, "count": len(events), "events": events}
+    if curated_drift:
+        out["curatedTableDrift"] = curated_drift
+        out["curatedTableDriftNote"] = ("The hardcoded curated macro table disagrees with the live "
+                                        "feed on these dates -- update _build_events / the rules table.")
     if live is None:
-        out["note"] = "Set FMP_API_KEY or FINNHUB_API_KEY for tick-precise CPI/PCE/PPI dates."
+        out["dataQuality"] = "UNVERIFIED"
+        out["warning"] = ("LIVE CALENDAR UNAVAILABLE - the TradingView endpoint failed and no "
+                          "FMP_API_KEY/FINNHUB_API_KEY is set. Dates below are hardcoded estimates "
+                          "that have previously been wrong by a full day. Do NOT plan a session "
+                          "around them without verifying.")
     return out
 
 
@@ -1113,9 +1332,21 @@ async def next_event(importance: str = "high") -> dict:
     fut.sort(key=lambda x: x[0])
     edt, e = fut[0]
     hrs = (edt - now).total_seconds() / 3600.0
-    return {"event": e["name"], "date": e["date"], "timeET": e.get("time"),
-            "importance": e["importance"], "source": e["source"],
-            "countdownHours": round(hrs, 1), "countdown": f"{int(hrs // 24)}d {int(hrs % 24)}h"}
+    out = {"event": e["name"], "date": e["date"], "timeET": e.get("time"),
+           "importance": e["importance"], "source": e["source"],
+           "countdownHours": round(hrs, 1), "countdown": f"{int(hrs // 24)}d {int(hrs % 24)}h"}
+    for k in ("actual", "forecast", "previous"):
+        if e.get(k) is not None:
+            out[k] = e[k]
+    src = (e.get("source") or "").lower()
+    if "verify" in src or "approx" in src or "rule" in src:
+        # This is the failure that put a phantom CPI on 2026-07-15 and drove a bad session plan.
+        # A guess must never be returned looking like a confirmed date.
+        out["UNVERIFIED"] = True
+        out["warning"] = ("This date is a hardcoded/rule-based ESTIMATE, not a confirmed release "
+                          "date. This table has been wrong by a full day. Verify before sizing "
+                          "or planning a session around it.")
+    return out
 
 
 # ======================================================================
@@ -1157,7 +1388,7 @@ SERIES = {
 
 
 _fred_client: Optional[httpx.Client] = None
-_fred_cache: dict = {}
+_fred_cache: "_TTLCache" = _TTLCache(256)   # (#7) bounded FRED series cache
 
 
 def _fred_get_client() -> httpx.Client:
@@ -1172,6 +1403,12 @@ def _fred_get_client() -> httpx.Client:
 # 4 series at once on a cold cache) can't trip rate limiting. These fetches run in to_thread workers,
 # so a threading semaphore is the right primitive; it gates only the HTTP GET below, not cache hits.
 _FRED_HTTP_SEM = threading.BoundedSemaphore(3)
+
+# (#11e) Cap concurrent robin_stocks calls the same way. Tools like watchlist_radar / event_risk_radar
+# / covered_call_manager fan out one _next_earnings thread per symbol; a 20-name list would otherwise
+# hit robin_stocks with ~20 simultaneous requests. These run in to_thread workers, so a threading
+# semaphore is the right primitive.
+_RH_SYNC_SEM = threading.BoundedSemaphore(4)
 
 
 class FredError(Exception):
@@ -1219,24 +1456,26 @@ def _fetch_series(series_id: str, start: Optional[str] = None,
             continue
     if not rows:
         raise FredError(f"No observations for series '{sid}' (check the series ID).")
-    _fred_cache[key] = (rows, time.monotonic())
+    _fred_cache.put(key, (rows, time.monotonic()))
     return rows
 
 
 def _latest_obs(series_id: str) -> Optional[tuple[str, float]]:
     # Bounded windows keep downloads small (full history of daily series is large/slow).
+    # B5: an empty window raises FredError -- CONTINUE to the wider window instead of bailing,
+    # so sparse/long-lag series still resolve. (The old `return None` made 1800 dead code.)
     for win in (450, 1800):
         try:
             rows = _fetch_series(series_id, start=_recent_window(win))
         except FredError:
-            return None
+            continue
         if rows:
             return rows[-1]
     return None
 
 
 def _recent_window(days: int) -> str:
-    return (_dt.date.today() - _dt.timedelta(days=days)).isoformat()
+    return (_today_et() - _dt.timedelta(days=days)).isoformat()   # B15: ET, not machine-local
 
 
 def _yoy(series_id: str) -> Optional[dict]:
@@ -1497,19 +1736,31 @@ async def _alpaca_get(path: str) -> Any:
     return r.json()
 
 
-async def _yahoo_price(symbol: str) -> Optional[float]:
-    # NOTE: Yahoo Finance is used ONLY here -- pricing non-SPX equity legs for the cross-broker risk
-    # rollup (_price_map). Every other live/historical/fundamental pull uses the Robinhood session
-    # (robin_stocks). Keyless and convenient, but the one anonymous, rate-limit-prone endpoint in the
-    # stack; it could be folded into robin_stocks get_latest_price to drop the Yahoo dependency.
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+def _rh_prices_sync(symbols: list) -> dict:
+    """(#11d) Batch last-trade prices for equity symbols via the Robinhood session in ONE get_quotes
+    call -- replaces the anonymous, rate-limit-prone Yahoo endpoint that was the stack's only keyless
+    third-party dependency. Missing symbols fall back to a per-symbol get_latest_price, else None."""
+    syms = [s for s in symbols if s]
+    if not syms:
+        return {}
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    out: dict = {}
     try:
-        r = await _get_client().get(url, params={"interval": "1d", "range": "1d"})
-        meta = r.json()["chart"]["result"][0]["meta"]
-        px = meta.get("regularMarketPrice") or meta.get("previousClose")
-        return float(px) if px is not None else None
+        for qr in (rh.get_quotes(syms) or []):
+            if qr and qr.get("symbol"):
+                out[qr["symbol"]] = _to_float(qr.get("last_trade_price")
+                                               or qr.get("last_extended_hours_trade_price"))
     except Exception:  # noqa: BLE001
-        return None
+        pass
+    for s in syms:
+        if out.get(s) is None:
+            try:
+                lp = rh.get_latest_price(s)
+                out[s] = _to_float(lp[0]) if lp else None
+            except Exception:  # noqa: BLE001
+                out[s] = None
+    return out
 
 
 def _greeks_risk(S: float, K: float, T: float, sigma: float, is_call: bool, r: float = RISK_FREE):
@@ -1645,15 +1896,21 @@ def _position_risk(p: dict, chain_by_sym: dict, spot: float, prices: dict) -> di
     mult = 100
     if p.get("delta") is not None and any(p.get(k) is not None for k in ("gamma", "theta", "vega")):
         undpx = float(p.get("price") or prices.get(p.get("underlying") or root) or 0.0)
+        if not undpx and (p.get("underlying") or root) in ("SPX", "SPXW"):
+            # B1: index underlyings have no equity quote (get_latest_price('SPXW') fails and the
+            # Yahoo map deliberately excludes index roots), which silently zeroed delta$/gamma$
+            # on exactly the 0DTE legs that matter most. Use the SPX chain spot instead.
+            undpx = float(spot or 0.0)
         d = float(p["delta"]); gg = float(p.get("gamma") or 0.0)
         th = float(p.get("theta") or 0.0); vg = float(p.get("vega") or 0.0)
         beta = _beta_of(p)
         dd = d * qty * mult * undpx
+        src = "broker" if undpx else "broker (NO UNDERLYING PRICE - delta$/gamma$ zeroed)"
         return {"broker": p["broker"], "symbol": p["symbol"], "underlying": (p.get("underlying") or root),
                 "type": "option", "qty": qty, "strike": strike, "expiry": expiry, "delta$": dd,
                 "gamma$_1pct": gg * qty * mult * undpx * undpx * 0.01,
                 "theta$_day": th * qty * mult, "vega$_1pct": vg * qty * mult,
-                "betaDelta$": dd * beta, "mv": p.get("mv"), "greeksSource": "broker"}
+                "betaDelta$": dd * beta, "mv": p.get("mv"), "greeksSource": src}
     if root in ("SPX", "SPXW") and expiry and strike:
         o = chain_by_sym.get(p["symbol"])
         iv = float(o["iv"]) if (o and o.get("iv")) else 0.0
@@ -1729,6 +1986,7 @@ def _rh_collect_sync() -> list:
     if _rh_cache["data"] is not None and (_t.time() - _rh_cache["ts"]) < RH_CACHE_TTL:
         return _rh_cache["data"]
     import robin_stocks.robinhood as rh
+    from robin_stocks.robinhood.helper import request_get
     _rh_login_sync()
 
     def _f(v):
@@ -1750,33 +2008,78 @@ def _rh_collect_sync() -> list:
         opos = rh.get_open_option_positions() or []
     except Exception:  # noqa: BLE001
         opos = []
+
+    # B14: this used to fire THREE sequential RH calls per option position (instrument detail,
+    # market data, latest underlying price) -- O(3N) round trips that made get_portfolio crawl.
+    # Collect the ids once, fetch instruments + market data in batches of 40 (the same ids= shape
+    # _rh_chain_sync uses) and all underlying quotes in a single get_quotes call; per-item calls
+    # remain only as a fallback when a batch misses an id.
+    live = []
     for pos in opos:
+        q = _f(pos.get("quantity")) or 0.0
+        if q == 0:
+            continue
+        opt_url = pos.get("option", "") or ""
+        oid = opt_url.rstrip("/").split("/")[-1] if opt_url else None
+        live.append((pos, oid, q))
+    ids = [oid for (_p, oid, _q) in live if oid]
+
+    inst_by_id, md_by_id = {}, {}
+    for i in range(0, len(ids), 40):
+        batch = ids[i:i + 40]
         try:
-            q = _f(pos.get("quantity")) or 0.0
-            if q == 0:
-                continue
+            for c in (request_get("https://api.robinhood.com/options/instruments/", "results",
+                                  {"ids": ",".join(batch)}) or []):
+                if c and c.get("id"):
+                    inst_by_id[c["id"]] = c
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for m in (request_get("https://api.robinhood.com/marketdata/options/", "results",
+                                  {"ids": ",".join(batch)}) or []):
+                if not m:
+                    continue
+                mid = (m.get("instrument") or "").rstrip("/").split("/")[-1]
+                if mid:
+                    md_by_id[mid] = m
+        except Exception:  # noqa: BLE001
+            pass
+
+    chains = sorted({(pos.get("chain_symbol") or "")
+                     for (pos, _o, _q) in live if pos.get("chain_symbol")})
+    px_by_sym = {}
+    if chains:
+        try:
+            for qr in (rh.get_quotes(chains) or []):
+                if qr and qr.get("symbol"):
+                    px_by_sym[qr["symbol"]] = _f(qr.get("last_trade_price"))
+        except Exception:  # noqa: BLE001
+            px_by_sym = {}
+
+    for pos, oid, q in live:
+        try:
             qty = q if (pos.get("type") or "").lower() != "short" else -q
             chain = pos.get("chain_symbol", "")
             opt_url = pos.get("option", "")
-            od = {}
-            if opt_url:
+            od = inst_by_id.get(oid) or {}
+            if not od and opt_url:                 # batch miss -> per-item fallback
                 try:
                     od = rh.helper.request_get(opt_url) or {}
                 except Exception:  # noqa: BLE001
                     od = {}
-            oid = od.get("id") or (opt_url.rstrip("/").split("/")[-1] if opt_url else None)
+            oid2 = od.get("id") or oid
             strike = _f(od.get("strike_price"))
             expiry = od.get("expiration_date")
             cp = {"call": "C", "put": "P"}.get(od.get("type"))
-            md = {}
-            if oid:
+            md = md_by_id.get(oid) or (md_by_id.get(oid2) if oid2 else None) or {}
+            if not md and oid2:
                 try:
-                    raw = rh.get_option_market_data_by_id(oid)
+                    raw = rh.get_option_market_data_by_id(oid2)
                     md = raw[0] if isinstance(raw, list) and raw else (raw or {})
                 except Exception:  # noqa: BLE001
                     md = {}
-            undpx = None
-            if chain:
+            undpx = px_by_sym.get(chain)
+            if undpx is None and chain:
                 try:
                     lp = rh.get_latest_price(chain)
                     undpx = _f(lp[0]) if lp else None
@@ -1865,6 +2168,99 @@ def _etrade_probe_sync() -> dict:
     return {"reachable": True, "accounts": len(al)}
 
 
+# ---- E*TRADE market data: an INDEPENDENT live price feed -------------------
+# Why this exists: every "is my data fresh?" check in this server ultimately leaned on ONE live
+# SPX print (Robinhood's undocumented index endpoint). When that endpoint moved (2026-07-16 it
+# returned nothing at all), _auto_basis fell through to its "uncalibrated" branch, which computes
+# basis = chainSpot - spy*mult -- making spxLiveEst IDENTICAL to chainSpot and gapVsChainPts
+# identically 0.0. The staleness detector silently became incapable of detecting staleness, and
+# reported a 15-min-old price as live. E*TRADE is a second, independent, genuinely real-time feed
+# (verified 2026-07-16: its VIX matched RH's print exactly at 16.30, and its SPX option-chain
+# parity matched RH's SPX index to ~0.1pt). It also self-reports quoteStatus=REALTIME|DELAYED.
+ET_QUOTE_TTL = 5.0
+_et_quote_cache: dict = {"ts": 0.0, "key": None, "data": None}
+
+
+def _etrade_market():
+    """pyetrade ETradeMarket built from the same cached OAuth session as _etrade_clients()."""
+    import pickle
+    import pyetrade
+    from dotenv import load_dotenv
+    envf = os.environ.get("ET_ENV_FILE", ET_ENV_DEFAULT)
+    if os.path.exists(envf):
+        load_dotenv(envf)
+    ck = os.environ.get("ETRADE_CONSUMER_KEY", "")
+    cs = os.environ.get("ETRADE_CONSUMER_SECRET", "")
+    if not (ck and cs):
+        raise EdgeError("E*TRADE consumer key/secret not found (ETRADE_CONSUMER_KEY/SECRET or ET_ENV_FILE).")
+    tf = os.environ.get("ET_TOKEN_FILE", ET_TOKEN_FILE_DEFAULT)
+    if not os.path.exists(tf):
+        raise EdgeError("E*TRADE token not found; authorize via the etrade MCP (setup_etrade_auth.py).")
+    tk = pickle.load(open(tf, "rb"))
+    dev = os.environ.get("ETRADE_SANDBOX", "false").lower() == "true"
+    return pyetrade.ETradeMarket(ck, cs, tk.get("oauth_token", ""),
+                                 tk.get("oauth_token_secret", ""), dev=dev)
+
+
+def _etrade_index_quote_sync(symbols: str = "SPX,VIX") -> dict:
+    """Live index/equity levels from E*TRADE. Same shape as _rh_index_quote_sync:
+    {SYMBOL: {value, asof, source, realtime}}.
+
+    Returns {} on ANY failure (expired token, network, unknown symbol) so callers fall through
+    rather than blow up. `realtime` carries E*TRADE's own quoteStatus so a DELAYED quote can
+    never be mistaken for a live one -- the whole point of this feed.
+    """
+    import time as _t
+    syms = [s.strip().upper() for s in str(symbols).split(",") if s.strip()]
+    if not syms:
+        return {}
+    key = ",".join(sorted(syms))
+    if _et_quote_cache["key"] == key and _et_quote_cache["data"] is not None \
+            and (_t.time() - _et_quote_cache["ts"]) < ET_QUOTE_TTL:
+        return _et_quote_cache["data"]
+    try:
+        raw = _etrade_market().get_quote(syms, resp_format="json")
+    except Exception as exc:  # noqa: BLE001 -- caller falls through to another source
+        log.info("E*TRADE quote unavailable (%s)", str(exc)[:140])
+        return {}
+    rows = _et_dig(raw, "QuoteResponse", "QuoteData", default=[])
+    if isinstance(rows, dict):
+        rows = [rows]
+    out = {}
+    for r in rows or []:
+        sym = str(_et_dig(r, "Product", "symbol") or "").upper()
+        val = _to_float(_et_dig(r, "All", "lastTrade"))
+        if not sym or not val:
+            continue
+        ts = r.get("dateTimeUTC")
+        asof = (_dt.datetime.fromtimestamp(ts, _dt.timezone.utc).astimezone(ET).isoformat()
+                if isinstance(ts, (int, float)) else r.get("dateTime"))
+        status = str(r.get("quoteStatus") or "").upper()
+        out[sym] = {"value": val, "asof": asof, "source": "etrade_market",
+                    "realtime": (status == "REALTIME"), "quoteStatus": status or None}
+    _et_quote_cache.update(ts=_t.time(), key=key, data=out)
+    return out
+
+
+async def _live_spx_print() -> tuple:
+    """An INDEPENDENT live SPX print, or (None, None). Tries Robinhood's index endpoint first, then
+    E*TRADE. Never derive SPX from the chain here -- that is exactly the circularity this avoids.
+    Returns (value, source_label)."""
+    import asyncio
+    for fn, label in ((_rh_index_quote_sync, "robinhood_index"),
+                      (_etrade_index_quote_sync, "etrade_market")):
+        try:
+            q = await asyncio.to_thread(fn, "SPX")
+        except Exception:  # noqa: BLE001
+            continue
+        row = (q or {}).get("SPX") or {}
+        if row.get("realtime") is False:      # E*TRADE explicitly told us it is delayed
+            continue
+        if row.get("value"):
+            return row["value"], label
+    return None, None
+
+
 def _etrade_collect_sync() -> list:
     import time as _t
     if _et_cache["data"] is not None and (_t.time() - _et_cache["ts"]) < ET_CACHE_TTL:
@@ -1928,7 +2324,150 @@ async def _etrade_positions() -> list:
     return await asyncio.to_thread(_etrade_collect_sync)
 
 
-async def _collect_positions(include_alpaca: bool, include_file: bool, include_robinhood: bool = True, include_etrade: bool = True) -> tuple:
+# ---- TastyTrade source (OAuth2 personal grant; shares the mcp-tastytrade .env) ----
+# Read-only by design: this process requests the "read" scope only, so a token minted
+# here cannot place an order even if the grant itself carries "trade". Order placement
+# lives in the mcp-tastytrade server, separately gated by TASTYTRADE_ALLOW_TRADING.
+TT_BASE_PROD = "https://api.tastyworks.com"
+TT_BASE_CERT = "https://api.cert.tastyworks.com"
+TT_ENV_DEFAULT = "/Users/jsconiers/Claude/mcp/mcp-tastytrade/.env"
+TT_CACHE_TTL = float(os.environ.get("TT_CACHE_TTL", "20"))
+
+_tt_token: dict = {"value": None, "exp": 0.0, "refreshes": 0}
+_tt_cache: dict = {"ts": 0.0, "data": None}
+
+
+def _tt_creds() -> tuple:
+    """(client_secret, refresh_token, scope, base_url). Process env wins; else the shared .env."""
+    sec = os.environ.get("TASTYTRADE_CLIENT_SECRET")
+    ref = os.environ.get("TASTYTRADE_REFRESH_TOKEN")
+    tt_env = os.environ.get("TASTYTRADE_ENV")
+    envf = os.environ.get("TASTYTRADE_ENV_FILE", TT_ENV_DEFAULT)
+    if not (sec and ref) and os.path.exists(envf):
+        for line in open(envf):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if not v:
+                continue
+            if k == "TASTYTRADE_CLIENT_SECRET" and not sec:
+                sec = v
+            elif k == "TASTYTRADE_REFRESH_TOKEN" and not ref:
+                ref = v
+            elif k == "TASTYTRADE_ENV" and not tt_env:
+                tt_env = v
+    # Scope is deliberately NOT sourced from the .env: that file carries "read trade" for
+    # the trading server. OAuth2 permits narrowing on refresh; this process only needs read.
+    scope = os.environ.get("TASTYTRADE_READ_SCOPE", "read")
+    base = TT_BASE_CERT if str(tt_env or "prod").lower() == "cert" else TT_BASE_PROD
+    return sec, ref, scope, base
+
+
+async def _tt_access_token(force: bool = False) -> str:
+    sec, ref, scope, base = _tt_creds()
+    if not (sec and ref):
+        raise EdgeError("TastyTrade credentials not found (set TASTYTRADE_CLIENT_SECRET/"
+                        "TASTYTRADE_REFRESH_TOKEN, or point TASTYTRADE_ENV_FILE at the .env).")
+    if not force and _tt_token["value"] and time.time() < (_tt_token["exp"] - 30):
+        return _tt_token["value"]
+    r = await _get_client().post(
+        base + "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": ref,
+              "client_secret": sec, "scope": scope},
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if r.status_code != 200:
+        # Never echo the body: it can contain the submitted secret.
+        raise EdgeError(f"TastyTrade OAuth refresh failed ({r.status_code}); check "
+                        "TASTYTRADE_CLIENT_SECRET / TASTYTRADE_REFRESH_TOKEN in the .env.")
+    d = r.json()
+    _tt_token["value"] = d["access_token"]
+    _tt_token["exp"] = time.time() + float(d.get("expires_in") or 900)
+    _tt_token["refreshes"] += 1
+    return _tt_token["value"]
+
+
+async def _tt_get(path: str, params: Optional[dict] = None) -> Any:
+    """GET a TastyTrade REST path, unwrapping the {data: ...} envelope. Retries once on 401."""
+    _, _, _, base = _tt_creds()
+    for attempt in (0, 1):
+        tok = await _tt_access_token(force=(attempt == 1))
+        r = await _get_client().get(base + path, params=params or {},
+                                    headers={"Authorization": f"Bearer {tok}"})
+        if r.status_code == 401 and attempt == 0:
+            continue
+        if r.status_code in (401, 403):
+            raise EdgeError(f"TastyTrade auth failed ({r.status_code}); the refresh token or "
+                            "grant scope may have been revoked.")
+        r.raise_for_status()
+        body = r.json()
+        return body.get("data", body) if isinstance(body, dict) else body
+    raise EdgeError("TastyTrade auth failed after refresh retry.")
+
+
+async def _tt_account_numbers() -> list:
+    envv = os.environ.get("TASTYTRADE_ACCOUNT_NUMBERS") or os.environ.get("TASTYTRADE_ACCOUNT_ID")
+    if envv:
+        return [a.strip() for a in envv.split(",") if a.strip()]
+    data = await _tt_get("/customers/me/accounts")
+    return [it["account"]["account-number"] for it in (data.get("items") or [])
+            if (it.get("account") or {}).get("account-number")]
+
+
+def _normalize_tastytrade(items: list, acct: str) -> tuple:
+    """-> (normalized rows, list of skipped instrument-types). TT pads OCC roots to 6 chars
+    with spaces ('SPXW  260717P06400000'); _parse_occ needs that whitespace gone."""
+    out, skipped = [], []
+    for p in items or []:
+        raw = str(p.get("symbol") or "")
+        itype = str(p.get("instrument-type") or "")
+        direction = str(p.get("quantity-direction") or "Long")
+        qty = _to_float(p.get("quantity")) or 0.0
+        if not raw or qty == 0 or direction == "Zero":
+            continue
+        qty = -qty if direction == "Short" else qty
+        px = _to_float(p.get("mark-price"))
+        if px is None:
+            px = _to_float(p.get("close-price"))
+        mult = _to_float(p.get("multiplier")) or (100.0 if itype == "Equity Option" else 1.0)
+        mv = (qty * mult * px) if px is not None else None
+        if itype == "Equity Option":
+            sym = "".join(raw.split())
+            parsed = _parse_occ(sym)
+            und = str(p.get("underlying-symbol") or "").strip() or (parsed[0] if parsed else sym)
+            row = {"broker": "tastytrade", "symbol": sym, "qty": qty, "type": "option",
+                   "underlying": und, "mv": mv, "account": acct}
+            if parsed:
+                row.update(expiry=parsed[1], cp=parsed[2], strike=parsed[3])
+            out.append(row)
+        elif itype in ("Equity", "Cryptocurrency"):
+            und = str(p.get("underlying-symbol") or "").strip() or raw
+            out.append({"broker": "tastytrade", "symbol": raw, "qty": qty, "type": "equity",
+                        "underlying": und, "price": px or 0.0, "mv": mv, "beta": None,
+                        "account": acct})
+        else:
+            # Futures / future options carry a different multiplier and symbology than
+            # _position_risk assumes. Surface them rather than corrupt the Greek rollup.
+            skipped.append(f"{raw} ({itype})")
+    return out, skipped
+
+
+async def _tastytrade_positions() -> tuple:
+    """-> (rows, skipped). Cached for TT_CACHE_TTL seconds like the other broker sources."""
+    if _tt_cache["data"] is not None and (time.time() - _tt_cache["ts"]) < TT_CACHE_TTL:
+        return _tt_cache["data"]
+    rows, skipped = [], []
+    for acct in await _tt_account_numbers():
+        data = await _tt_get(f"/accounts/{acct}/positions", {"include-marks": "true"})
+        r, s = _normalize_tastytrade(data.get("items") or [], acct)
+        rows += r
+        skipped += s
+    _tt_cache["data"], _tt_cache["ts"] = (rows, skipped), time.time()
+    return rows, skipped
+
+
+async def _collect_positions(include_alpaca: bool, include_file: bool, include_robinhood: bool = True, include_etrade: bool = True, include_tastytrade: bool = True) -> tuple:
     positions, meta = [], {}
     if include_alpaca:
         try:
@@ -1937,6 +2476,8 @@ async def _collect_positions(include_alpaca: bool, include_file: bool, include_r
             meta["alpaca"] = len(rows)
         except EdgeError as exc:
             meta["alpacaError"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 (B9: a transport error must not kill the rollup)
+            meta["alpacaError"] = f"{type(exc).__name__}: {str(exc)[:140]}"
     if include_robinhood:
         try:
             rhpos = await _robinhood_positions()
@@ -1955,6 +2496,17 @@ async def _collect_positions(include_alpaca: bool, include_file: bool, include_r
             meta["etradeError"] = str(exc)
         except Exception as exc:  # noqa: BLE001
             meta["etradeError"] = f"{type(exc).__name__}: {str(exc)[:140]}"
+    if include_tastytrade:
+        try:
+            ttpos, ttskip = await _tastytrade_positions()
+            positions += ttpos
+            meta["tastytrade"] = len(ttpos)
+            if ttskip:
+                meta["tastytradeSkipped"] = ttskip
+        except EdgeError as exc:
+            meta["tastytradeError"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            meta["tastytradeError"] = f"{type(exc).__name__}: {str(exc)[:140]}"
     if include_file:
         try:
             fpos, path = _read_positions_file()
@@ -1962,9 +2514,11 @@ async def _collect_positions(include_alpaca: bool, include_file: bool, include_r
             meta["file"], meta["filePath"] = len(fpos), path
         except EdgeError as exc:
             meta["fileError"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 (B9)
+            meta["fileError"] = f"{type(exc).__name__}: {str(exc)[:140]}"
     # explicit per-source inclusion flags (a stale OAuth must not silently drop legs)
     _req = {"alpaca": include_alpaca, "robinhood": include_robinhood,
-            "etrade": include_etrade, "file": include_file}
+            "etrade": include_etrade, "tastytrade": include_tastytrade, "file": include_file}
     for _src, _on in _req.items():
         if _on:
             meta[f"{_src}Included"] = (f"{_src}Error" not in meta)
@@ -1977,6 +2531,8 @@ async def _price_map(positions: list, spot: float) -> dict:
         if p["type"] == "equity" and not p.get("price"):
             need.add(p["underlying"])
         elif p["type"] == "option":
+            if p.get("price"):     # B13: broker already priced the underlying; skip Yahoo
+                continue
             root = (_parse_occ(p["symbol"]) or [""])[0] or (p.get("underlying") or "")
             if root not in ("SPX", "SPXW"):
                 need.add(p.get("underlying") or root)
@@ -1984,12 +2540,12 @@ async def _price_map(positions: list, spot: float) -> dict:
     if not need:
         return {}
     import asyncio
-    vals = await asyncio.gather(*[_yahoo_price(s) for s in need])
-    return {s: v for s, v in zip(need, vals)}
+    prices = await asyncio.to_thread(_rh_prices_sync, need)   # (#11d) RH batch, was Yahoo fan-out
+    return {s: prices.get(s) for s in need}
 
 
-async def _aggregate(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
-    positions, meta = await _collect_positions(include_alpaca, include_file, include_robinhood, include_etrade)
+async def _aggregate(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True, include_tastytrade: bool = True) -> dict:
+    positions, meta = await _collect_positions(include_alpaca, include_file, include_robinhood, include_etrade, include_tastytrade)
     chain, spot = None, 0.0
     has_spx = any(p["type"] == "option" and ((_parse_occ(p["symbol"]) or [""])[0] in ("SPX", "SPXW"))
                   for p in positions)
@@ -2056,6 +2612,23 @@ async def risk_status() -> dict:
     else:
         et["reachable"] = False
     out["etrade"] = et
+    tt_sec, tt_ref, tt_scope, tt_base = _tt_creds()
+    tt = {"configured": bool(tt_sec and tt_ref),
+          "envFile": os.environ.get("TASTYTRADE_ENV_FILE", TT_ENV_DEFAULT),
+          "env": "cert" if tt_base == TT_BASE_CERT else "prod",
+          "scope": tt_scope, "readOnly": "trade" not in tt_scope}
+    # Same rule as E*TRADE: "credentials on disk" != "grant still valid" -- probe it.
+    if tt["configured"]:
+        try:
+            accts = await _tt_account_numbers()
+            tt.update(reachable=True, accounts=len(accts), tokenRefreshes=_tt_token["refreshes"])
+        except EdgeError as exc:
+            tt.update(reachable=False, error=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            tt.update(reachable=False, error=f"{type(exc).__name__}: {str(exc)[:140]}")
+    else:
+        tt["reachable"] = False
+    out["tastytrade"] = tt
     _, fpath = _read_positions_file()
     out["positionsFile"] = {"path": fpath, "exists": os.path.exists(fpath)}
     return out
@@ -2111,6 +2684,30 @@ async def robinhood_positions() -> dict:
 
 
 @mcp.tool()
+async def tastytrade_positions() -> dict:
+    """Live tastytrade holdings (stocks + equity/index options) via the OAuth2 personal grant.
+
+    Shares the mcp-tastytrade .env (TASTYTRADE_CLIENT_SECRET / TASTYTRADE_REFRESH_TOKEN), but mints
+    its own read-scoped token, so this path can never place an order. SPX/SPXW legs are re-priced and
+    Greeked from CBOE by the risk rollup; equities are marked from the broker. Futures and future
+    options are reported under `skipped` rather than mixed into the Greek totals.
+    """
+    try:
+        pos, skipped = await _tastytrade_positions()
+    except EdgeError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    stocks = [x for x in pos if x["type"] == "equity"]
+    opts = [x for x in pos if x["type"] == "option"]
+    out = {"count": len(pos), "stocks": len(stocks), "options": len(opts),
+           "env": "cert" if _tt_creds()[3] == TT_BASE_CERT else "prod", "positions": pos}
+    if skipped:
+        out["skipped"] = skipped
+    return out
+
+
+@mcp.tool()
 async def load_positions() -> dict:
     """Show the broker-agnostic positions file (for holdings not in Alpaca, e.g. Robinhood/E*TRADE).
 
@@ -2141,14 +2738,14 @@ def _exposure(r: dict) -> float:
 
 
 @mcp.tool()
-async def net_greeks(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
+async def net_greeks(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True, include_tastytrade: bool = True) -> dict:
     """Net portfolio Greeks aggregated across Alpaca and the positions file.
 
     Sums dollar delta, dollar gamma (per 1% move), theta (per day), and vega (per 1% vol). SPX/SPXW
     options get full Black-Scholes Greeks off CBOE; equities contribute delta only (beta-weighted);
     other instruments use whatever the positions file provides. Delta is also expressed in SPX points.
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade, include_tastytrade)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -2162,6 +2759,7 @@ async def net_greeks(include_alpaca: bool = True, include_file: bool = True, inc
         cov[r["greeksSource"]] = cov.get(r["greeksSource"], 0) + 1
     out = {
         "spot": round(spot, 2) if spot else None,
+        "source": agg.get("chainSource"), "freshness": agg.get("chainFreshness"),   # (#1)
         "positions": len(risks),
         "netDelta$": round(netd, 0),
         "netDelta_betaWeighted$": round(netbd, 0),
@@ -2178,12 +2776,12 @@ async def net_greeks(include_alpaca: bool = True, include_file: bool = True, inc
 
 
 @mcp.tool()
-async def risk_summary(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
+async def risk_summary(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True, include_tastytrade: bool = True) -> dict:
     """Portfolio risk overview: beta-weighted SPX exposure, gross/long/short notional, and breakdowns.
 
     Groups exposure by broker and by underlying, and lists the largest directional contributors.
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade, include_tastytrade)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -2200,6 +2798,7 @@ async def risk_summary(include_alpaca: bool = True, include_file: bool = True, i
     netbd = _sum(risks, "betaDelta$")
     return {
         "spot": round(spot, 2) if spot else None,
+        "source": agg.get("chainSource"), "freshness": agg.get("chainFreshness"),   # (#1)
         "netBetaDelta$": round(netbd, 0),
         "netBetaDelta_SPXpoints": (round(netbd / spot, 1) if spot else None),
         "grossNotional$": round(gross, 0),
@@ -2215,12 +2814,12 @@ async def risk_summary(include_alpaca: bool = True, include_file: bool = True, i
 
 
 @mcp.tool()
-async def concentration(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True) -> dict:
+async def concentration(include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True, include_tastytrade: bool = True) -> dict:
     """Exposure concentration by underlying, flagging any name above the concentration threshold.
 
     Threshold defaults to 25% of gross exposure (override with CONCENTRATION_PCT).
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade, include_tastytrade)
     risks = agg["positions"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -2241,7 +2840,7 @@ async def concentration(include_alpaca: bool = True, include_file: bool = True, 
 @mcp.tool()
 async def scenario_shock(
     moves_pct: Optional[str] = None,
-    include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True,
+    include_alpaca: bool = True, include_file: bool = True, include_robinhood: bool = True, include_etrade: bool = True, include_tastytrade: bool = True,
 ) -> dict:
     """Estimate portfolio P&L under a set of SPX % moves using net beta-delta + net gamma convexity.
 
@@ -2249,7 +2848,7 @@ async def scenario_shock(
     positions use delta + gamma; everything else is beta-weighted linear. A quick risk read, not a
     full revaluation.
     """
-    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade)
+    agg = await _aggregate(include_alpaca, include_file, include_robinhood, include_etrade, include_tastytrade)
     risks, spot = agg["positions"], agg["spot"]
     if not risks:
         return {"note": "No positions found.", "sources": agg["meta"]}
@@ -2269,6 +2868,7 @@ async def scenario_shock(
                      "spxLevel": (round(spot * (1 + m), 2) if spot else None),
                      "estPnL$": round(pnl, 0)})
     return {"spot": round(spot, 2) if spot else None,
+            "source": agg.get("chainSource"), "freshness": agg.get("chainFreshness"),   # (#1)
             "netBetaDelta$": round(netbd, 0), "netGamma$_per_1pct": round(netg, 0),
             "scenarios": scen,
             "method": "P&L = betaDelta$*move + 50*gamma$1pct*move^2 (gamma applies to SPX/SPXW legs)",
@@ -2326,21 +2926,27 @@ RAPID_REENTRY_SECS = float(os.environ.get("TE_RAPID_REENTRY_SECS", "90"))
 LATE_SESSION_ET = os.environ.get("TE_LATE_SESSION_ET", "15:45")  # final-stretch caution
 
 
-def _rh_recent_option_orders(stop_date: _dt.date, max_pages: int = 6) -> list:
-    """Filled+other option orders, newest-first, paginating only until we pass stop_date (ET)."""
+def _rh_recent_option_orders(stop_date: _dt.date, max_pages: int = 12, page_size: int = 100):
+    """Filled+other option orders, newest-first, paginating only until we pass stop_date (ET).
+
+    B7: returns (orders, meta). meta['truncated'] is True when we hit the page cap while more
+    in-window history still remained (a 'next' page existed and the oldest row seen had not yet
+    crossed stop_date), so callers can flag 'YTD'/window figures that are actually partial.
+    page_size lifts RH's ~10-per-page default so a full year fits in far fewer round trips."""
     import robin_stocks.robinhood as rh
     _rh_login_sync()
     try:
-        url = rh.urls.option_orders()
+        base = rh.urls.option_orders()
     except Exception:  # noqa: BLE001
-        url = "https://api.robinhood.com/options/orders/"
-    out, page = [], 0
+        base = "https://api.robinhood.com/options/orders/"
+    sep = "&" if "?" in base else "?"
+    url = f"{base}{sep}page_size={int(page_size)}"
+    out, page, oldest_d = [], 0, None
     data = rh.helper.request_get(url, "regular")
     while data and isinstance(data, dict):
         results = data.get("results", []) or []
         out.extend(results)
         page += 1
-        oldest_d = None
         if results:
             try:
                 oldest_d = _dt.datetime.fromisoformat(
@@ -2348,19 +2954,53 @@ def _rh_recent_option_orders(stop_date: _dt.date, max_pages: int = 6) -> list:
             except Exception:  # noqa: BLE001
                 oldest_d = None
         nxt = data.get("next")
-        if not nxt or page >= max_pages or (oldest_d and oldest_d < stop_date):
-            break
+        passed = bool(oldest_d and oldest_d < stop_date)
+        if not nxt or page >= max_pages or passed:
+            truncated = bool(nxt) and (page >= max_pages) and not passed
+            return out, {"pages": page, "truncated": truncated,
+                         "oldestSeen": oldest_d.isoformat() if oldest_d else None}
         data = rh.helper.request_get(nxt, "regular")
-    return out
+    return out, {"pages": page, "truncated": False,
+                 "oldestSeen": oldest_d.isoformat() if oldest_d else None}
 
 
-def _order_to_fill(o: dict):
+def _leg_fill(o: dict, lg: dict, when, trade_date: str) -> Optional[dict]:
+    """One per-leg fill record from a (multi-leg) option order leg. Cash flow is the leg's OWN
+    signed premium: sell = credit (+), buy = debit (-). Carries order_id so round-trip matching
+    can dedupe the several legs that share one spread/roll order."""
+    exs = lg.get("executions") or []
+    qty, gross, px_last = 0.0, 0.0, None
+    for ex in exs:
+        q = _to_float(ex.get("quantity")) or 0.0
+        p = _to_float(ex.get("price"))
+        if p is not None:
+            px_last = p
+            gross += p * q
+        qty += q
+    if qty <= 0:
+        qty = _to_float(lg.get("ratio_quantity")) or 0.0
+    side = lg.get("side")
+    sign = 1.0 if side == "sell" else -1.0
+    return {"time": when, "trade_date": trade_date, "chain": o.get("chain_symbol", ""),
+            "n_legs": len(o.get("legs") or []), "net_cf": sign * gross * 100.0,
+            "gross_premium": None, "qty": qty,
+            "option_id": (lg.get("option") or "").rstrip("/").split("/")[-1],
+            "side": side, "effect": lg.get("position_effect"),
+            "strike": _to_float(lg.get("strike_price")),
+            "cp": {"call": "C", "put": "P"}.get(lg.get("option_type")),
+            "expiry": lg.get("expiration_date"),
+            "price": px_last, "order_id": o.get("id")}
+
+
+def _order_to_fills(o: dict) -> list:
+    """B2: decompose an option order into per-leg fill records so MULTI-LEG orders (vertical
+    spreads, rolls) are visible to round-trip matching -- the old _order_to_fill collapsed them
+    into a single effect=None record that every P&L/discipline tool silently skipped. Single-leg
+    orders yield one record identical in shape (and net_cf semantics) to the legacy output.
+    Returns [] for unfilled orders."""
     if o.get("state") != "filled":
-        return None
+        return []
     legs = o.get("legs", []) or []
-    net = _to_float(o.get("net_amount")) or 0.0
-    direction = o.get("net_amount_direction") or o.get("direction")
-    net_cf = net if direction == "credit" else -net
     ts, trade_date = None, None
     for lg in legs:
         for ex in (lg.get("executions") or []):
@@ -2372,41 +3012,78 @@ def _order_to_fill(o: dict):
     try:
         when = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ET)
     except Exception:  # noqa: BLE001
-        return None
+        return []
     trade_date = trade_date or when.date().isoformat()
-    rec = {"time": when, "trade_date": trade_date, "chain": o.get("chain_symbol", ""),
-           "n_legs": len(legs), "net_cf": net_cf,
-           "gross_premium": _to_float(o.get("processed_premium")),
-           "qty": _to_float(o.get("processed_quantity")) or _to_float(o.get("quantity")) or 0.0}
+
     if len(legs) == 1:
+        net = _to_float(o.get("net_amount")) or 0.0
+        direction = o.get("net_amount_direction") or o.get("direction")
+        net_cf = net if direction == "credit" else -net
         lg = legs[0]
         ex0 = (lg.get("executions") or [{}])
-        rec.update({"option_id": (lg.get("option") or "").rstrip("/").split("/")[-1],
-                    "side": lg.get("side"), "effect": lg.get("position_effect"),
-                    "strike": _to_float(lg.get("strike_price")),
-                    "cp": {"call": "C", "put": "P"}.get(lg.get("option_type")),
-                    "expiry": lg.get("expiration_date"),
-                    "price": _to_float(ex0[0].get("price")) if ex0 else None})
-    else:
-        rec.update({"option_id": "multi:" + (o.get("id") or ""), "effect": None,
-                    "strike": None, "cp": None, "expiry": None})
-    return rec
+        return [{"time": when, "trade_date": trade_date, "chain": o.get("chain_symbol", ""),
+                 "n_legs": 1, "net_cf": net_cf,
+                 "gross_premium": _to_float(o.get("processed_premium")),
+                 "qty": _to_float(o.get("processed_quantity")) or _to_float(o.get("quantity")) or 0.0,
+                 "option_id": (lg.get("option") or "").rstrip("/").split("/")[-1],
+                 "side": lg.get("side"), "effect": lg.get("position_effect"),
+                 "strike": _to_float(lg.get("strike_price")),
+                 "cp": {"call": "C", "put": "P"}.get(lg.get("option_type")),
+                 "expiry": lg.get("expiration_date"),
+                 "price": _to_float(ex0[0].get("price")) if ex0 else None,
+                 "order_id": o.get("id")}]
 
-
-def _day_fills_sync(date_iso: str) -> list:
-    target = _dt.date.fromisoformat(date_iso)
-    fills = []
-    for o in _rh_recent_option_orders(target):
-        f = _order_to_fill(o)
-        if f and f["trade_date"] == date_iso:
-            fills.append(f)
-    fills.sort(key=lambda r: r["time"])
+    fills = [rec for lg in legs if (rec := _leg_fill(o, lg, when, trade_date)) is not None]
+    if not fills:
+        net = _to_float(o.get("net_amount")) or 0.0
+        direction = o.get("net_amount_direction") or o.get("direction")
+        net_cf = net if direction == "credit" else -net
+        fills.append({"time": when, "trade_date": trade_date, "chain": o.get("chain_symbol", ""),
+                      "n_legs": len(legs), "net_cf": net_cf, "gross_premium": None,
+                      "qty": _to_float(o.get("processed_quantity")) or 0.0,
+                      "option_id": "multi:" + (o.get("id") or ""), "side": None, "effect": None,
+                      "strike": None, "cp": None, "expiry": None, "price": None,
+                      "order_id": o.get("id"), "legFallback": True})
     return fills
 
 
-async def _day_fills(date_iso: str) -> list:
+def _day_fills_sync(date_iso: str):
+    """B2/B7: returns (fills, meta). fills now include per-leg records for multi-leg orders."""
+    target = _dt.date.fromisoformat(date_iso)
+    orders, ometa = _rh_recent_option_orders(target)
+    fills, leg_fallbacks = [], 0
+    for o in orders:
+        for f in _order_to_fills(o):
+            if f.get("trade_date") == date_iso:
+                if f.get("legFallback"):
+                    leg_fallbacks += 1
+                fills.append(f)
+    fills.sort(key=lambda r: r["time"])
+    meta = dict(ometa)
+    meta["legFallback"] = leg_fallbacks
+    return fills, meta
+
+
+async def _day_fills(date_iso: str):
     import asyncio
     return await asyncio.to_thread(_day_fills_sync, date_iso)
+
+
+def _fill_data_warnings(fmeta: dict, tstats: dict) -> list:
+    """B2/B7: human-readable warnings when the realized-P&L picture may be incomplete."""
+    w = []
+    if fmeta.get("truncated"):
+        w.append("Order history hit the page cap; some older fills for this window may be missing.")
+    if fmeta.get("legFallback"):
+        w.append(f"{fmeta['legFallback']} multi-leg order(s) could not be split into legs; "
+                 f"their round trips may be approximate.")
+    if tstats.get("unmatchedCloses"):
+        w.append(f"{tstats['unmatchedCloses']} closing fill(s) had no matching open in this "
+                 f"window (${tstats['unmatchedCloseCF$']:.2f} cash) - the opens likely predate it.")
+    if tstats.get("orderLevelFallback"):
+        w.append(f"{tstats['orderLevelFallback']} order(s) counted at order level only "
+                 f"(${tstats['fallbackCF$']:.2f} cash).")
+    return w
 
 
 def _fmt_et(d) -> str:
@@ -2433,32 +3110,53 @@ def _build_curve(trips: list, target: float) -> dict:
             "crossIdx": cross_i, "crossCum": cross_cum, "crossTime": cross_time}
 
 
-def _round_trips(fills: list) -> list:
+def _round_trips_full(fills: list):
+    """B2: FIFO round-trip matcher that ALSO reports unmatched closes (a close with no open lot
+    in-window -- e.g. the open was truncated out of the window, or was a leg we couldn't
+    decompose) and order-level fallbacks. Each trip carries open_order_id/close_order_id so
+    callers can dedupe spread legs. Returns (trips, stats)."""
     from collections import defaultdict, deque
     lots = defaultdict(deque)
     trips = []
+    unmatched_n, unmatched_cf, fallback_n, fallback_cf = 0, 0.0, 0, 0.0
     for f in fills:
         oid, eff, qty, net = f.get("option_id"), f.get("effect"), (f.get("qty") or 0.0), f["net_cf"]
+        if isinstance(oid, str) and oid.startswith("multi:"):
+            fallback_n += 1
+            fallback_cf += net
+            continue
         if eff == "open" and qty > 0:
-            lots[oid].append([qty, net, f["time"]])
+            lots[oid].append([qty, net, f["time"], f.get("order_id")])
         elif eff == "close" and qty > 0:
             remaining = qty
             close_per = net / qty if qty else 0.0
             while remaining > 1e-9 and lots[oid]:
                 lot = lots[oid][0]
-                lot_qty, lot_cost, lot_time = lot
+                lot_qty, lot_cost, lot_time, lot_oid = lot
                 take = min(remaining, lot_qty)
                 open_per = lot_cost / lot_qty if lot_qty else 0.0
                 trips.append({"open": lot_time, "close": f["time"], "chain": f.get("chain"),
                               "strike": f.get("strike"), "cp": f.get("cp"), "qty": take,
                               "pnl": take * (open_per + close_per),
                               "holdSec": (f["time"] - lot_time).total_seconds(),
-                              "expiry": f.get("expiry"), "option_id": oid})
+                              "expiry": f.get("expiry"), "option_id": oid,
+                              "open_order_id": lot_oid, "close_order_id": f.get("order_id")})
                 lot_qty -= take
                 lot[0], lot[1] = lot_qty, lot_cost - open_per * take
                 remaining -= take
                 if lot_qty <= 1e-9:
                     lots[oid].popleft()
+            if remaining > 1e-9:
+                unmatched_n += 1
+                unmatched_cf += close_per * remaining
+    stats = {"unmatchedCloses": unmatched_n, "unmatchedCloseCF$": round(unmatched_cf, 2),
+             "orderLevelFallback": fallback_n, "fallbackCF$": round(fallback_cf, 2)}
+    return trips, stats
+
+
+def _round_trips(fills: list) -> list:
+    """Back-compat wrapper (trips only)."""
+    trips, _ = _round_trips_full(fills)
     return trips
 
 
@@ -2474,19 +3172,26 @@ async def daily_pnl_curve(date: Optional[str] = None, target: Optional[float] = 
     d = date or _today_et().isoformat()
     tgt = float(target) if target is not None else _target()
     try:
-        fills = await _day_fills(d)
+        fills, fmeta = await _day_fills(d)
     except EdgeError as exc:
         return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     if not fills:
-        return {"date": d, "note": "No filled option orders for this date.", "realized$": 0.0,
+        out0 = {"date": d, "note": "No filled option orders for this date.", "realized$": 0.0,
                 "orders": 0}
-    trips = _round_trips(fills)
+        if fmeta.get("truncated"):
+            out0["dataWarning"] = "Order history hit the page cap before this date; older fills may be missing."
+        return out0
+    trips, tstats = _round_trips_full(fills)   # B2: multi-leg spreads/rolls now matched
     cash = round(sum(f["net_cf"] for f in fills), 2)
+    data_warnings = _fill_data_warnings(fmeta, tstats)
     if not trips:
-        return {"date": d, "orders": len(fills), "netCashFlow$": cash,
+        out1 = {"date": d, "orders": len(fills), "netCashFlow$": cash,
                 "note": "No completed round trips - positions may still be open or expired by assignment."}
+        if data_warnings:
+            out1["dataWarnings"] = data_warnings
+        return out1
     cur = _build_curve(trips, tgt)
     by_chain = {}
     for tr in trips:
@@ -2499,7 +3204,13 @@ async def daily_pnl_curve(date: Optional[str] = None, target: Optional[float] = 
            "firstFill": _fmt_et(fills[0]["time"]), "lastFill": _fmt_et(fills[-1]["time"])}
     if abs(cash - cur["total"]) > 1.0:
         out["netCashFlow$"] = cash
-        out["reconNote"] = "Net cash flow differs from round-trip realized; some positions expired or remain open."
+        out["reconNote"] = ("Net cash flow differs from round-trip realized P&L. Usual causes: a "
+                            "position opened on an earlier date and closed today (or opened today and "
+                            "still open), a same-day expiring/assigned leg, or an unmatched close - "
+                            "see reconStats.")
+        out["reconStats"] = tstats
+    if data_warnings:
+        out["dataWarnings"] = data_warnings
     if cur["crossIdx"] is not None:
         out["targetCross"] = {"time": _fmt_et(cur["crossTime"]),
                               "tradesAfter": len(trips) - 1 - cur["crossIdx"],
@@ -2523,15 +3234,19 @@ async def daily_review(date: Optional[str] = None, target: Optional[float] = Non
     d = date or _today_et().isoformat()
     tgt = float(target) if target is not None else _target()
     try:
-        fills = await _day_fills(d)
+        fills, fmeta = await _day_fills(d)
     except EdgeError as exc:
         return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
-    trips = _round_trips(fills)
+    trips, tstats = _round_trips_full(fills)
+    data_warnings = _fill_data_warnings(fmeta, tstats)
     if not trips:
-        return {"date": d, "note": "No completed round trips for this date.",
+        out0 = {"date": d, "note": "No completed round trips for this date.",
                 "orders": len(fills)}
+        if data_warnings:
+            out0["dataWarnings"] = data_warnings
+        return out0
     cur = _build_curve(trips, tgt)
     cross_time = cur["crossTime"]
     wins = [t for t in trips if t["pnl"] > 0]
@@ -2579,11 +3294,14 @@ async def daily_review(date: Optional[str] = None, target: Optional[float] = Non
                               f"${abs(a['pnl$']):.2f}/session here.")
     else:
         out["note2"] = "Target not reached this session."
+    if data_warnings:
+        out["dataWarnings"] = data_warnings
     return out
 
 
 @mcp.tool()
-async def should_i_trade(date: Optional[str] = None, target: Optional[float] = None) -> dict:
+async def should_i_trade(date: Optional[str] = None, target: Optional[float] = None,
+                         strict: bool = False) -> dict:
     """Real-time GO / CAUTION / STOP gate before your next 0DTE entry.
 
     Combines past-target status, give-back from your intraday peak, consecutive losses, rapid re-entry
@@ -2603,11 +3321,30 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     now = _dt.datetime.now(ET)
-    trips = _round_trips(fills)
+    trips, tstats = _round_trips_full(fills)
     cur = _build_curve(trips, tgt)
     total = cur["total"]
     peak = cur["peak"]
     reasons, flags = [], []
+
+    # B2: if the fill picture is incomplete, the discipline math (realized$, peak, streaks) can't
+    # be trusted -- so this gate must never clear you to GO on partial data.
+    data_warnings = _fill_data_warnings(fmeta, tstats)
+    data_incomplete = bool(data_warnings)
+    # (#5) Optional integrity cross-check: reconcile the gate's round-trip realized against the
+    # independent recon reconstruction; a >$1 disagreement means the two views of the tape differ,
+    # so the gate must not clear you. Off by default because it re-pages RH (latency on the hot path).
+    if strict and is_today:
+        import asyncio
+        try:
+            _recon = await asyncio.to_thread(_rh_realized_recon_sync, d)
+            _rr = _recon.get("roundTripRealized$")
+            if _rr is not None and abs(_rr - round(total, 2)) > 1.0:
+                data_incomplete = True
+                data_warnings.append(f"Reconstruction cross-check disagrees: gate ${total:.2f} vs "
+                                     f"recon ${_rr:.2f} - treating inputs as incomplete.")
+        except Exception:  # noqa: BLE001
+            pass
 
     past_target = total >= tgt and tgt > 0
     giveback = peak >= tgt and (peak - total) >= giveback_frac * tgt
@@ -2615,14 +3352,29 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     consec_losses = len(last3) >= 3 and all(t["pnl"] < 0 for t in last3)
     consec2 = len(trips) >= 2 and all(t["pnl"] < 0 for t in trips[-2:])
     deep_dd = total <= -0.5 * tgt
-    # rapid re-entry: tight gaps between last few opens
-    opens = [f["time"] for f in fills if f.get("effect") == "open"]
+    # rapid re-entry: tight gaps between the last few DISTINCT opening ORDERS. Dedupe by order_id
+    # (B2) so the several legs of one spread -- which fill at the same instant -- don't look like
+    # churning and trip a false RAPID_REENTRY.
+    open_times = {}
+    for f in fills:
+        if f.get("effect") == "open":
+            oid = f.get("order_id") or id(f)
+            t_ = f["time"]
+            if oid not in open_times or t_ < open_times[oid]:
+                open_times[oid] = t_
+    opens = sorted(open_times.values())
     rapid = False
     if len(opens) >= 3:
         gaps = [(opens[i] - opens[i - 1]).total_seconds() for i in range(-2, 0)]
         rapid = all(g < rapid_secs for g in gaps)
+    # late-session gate keyed to the ACTUAL session close (B8): the configured cutoff, or 15
+    # minutes before an early close, whichever is earlier -- and only while the market is open.
+    _dd = _dt.date.fromisoformat(d)
+    close_dt = _dt.datetime.combine(_dd, _session_close_et(_dd), tzinfo=ET)
     lh, lm = (int(x) for x in late_et.split(":"))
-    late = is_today and (now.hour, now.minute) >= (lh, lm) and now.hour < 16
+    cfg_cut = _dt.datetime.combine(_dd, _dt.time(lh, lm), tzinfo=ET)
+    gate_dt = min(cfg_cut, close_dt - _dt.timedelta(minutes=15))
+    late = is_today and now >= gate_dt and now < close_dt
 
     if past_target:
         flags.append("PAST_TARGET")
@@ -2645,18 +3397,26 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     if late:
         flags.append("LATE_SESSION")
         reasons.append(f"It's {now.strftime('%H:%M')} ET - final-stretch 0DTE gamma/pin risk into the bell.")
+    if data_incomplete:
+        flags.append("DATA_INCOMPLETE")
+        reasons.extend(data_warnings)
 
     if past_target or consec_losses or giveback:
         verdict = "STOP"
+    elif data_incomplete:
+        verdict = "UNKNOWN"     # B2: partial fills -> cannot clear you to trade
     elif late or rapid or deep_dd or consec2:
         verdict = "CAUTION"
     else:
         verdict = "GO"
     if not reasons:
         reasons.append("No discipline flags: within target, no tilt signals, normal pacing.")
-    return {"date": d, "verdict": verdict, "flags": flags, "reasons": reasons,
-            "realized$": round(total, 2), "peak$": round(peak, 2), "target$": round(tgt, 2),
-            "roundTrips": len(trips), "asof": now.strftime("%H:%M:%S ET") if is_today else "EOD review"}
+    out = {"date": d, "verdict": verdict, "flags": flags, "reasons": reasons,
+           "realized$": round(total, 2), "peak$": round(peak, 2), "target$": round(tgt, 2),
+           "roundTrips": len(trips), "asof": now.strftime("%H:%M:%S ET") if is_today else "EOD review"}
+    if data_incomplete:
+        out["dataWarnings"] = data_warnings
+    return out
 
 
 # ============================================================================
@@ -2707,7 +3467,8 @@ async def expected_move(expiration: Optional[str] = None, zero_dte: bool = True,
     +/-2 sigma price levels. Defaults to today's SPXW expiry (`zero_dte=True`).
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=zero_dte,     # B3: RH-live primary, was CBOE-only
+                                     expiration=(None if zero_dte else expiration), root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
@@ -2722,9 +3483,12 @@ async def expected_move(expiration: Optional[str] = None, zero_dte: bool = True,
         resolved = exp
     if not opts:
         return {"error": "No contracts for that selection."}
-    em = _em_levels(spot, opts, None if resolved == "today" else resolved)
+    # B11: on a 0DTE ("today") request pass today's date -- not None -- so the IV-based 1-sigma
+    # (ivBasedMovePts) still computes instead of silently disabling.
+    exp_for_T = _today_et().isoformat() if resolved == "today" else resolved
+    em = _em_levels(spot, opts, exp_for_T)
     return {"root": root.upper(), "expiration": resolved, "spot": round(spot, 2),
-            "asof": ch.get("asof"), **em}
+            "asof": ch.get("asof"), "source": ch.get("source"), "freshness": ch.get("freshness"), **em}
 
 
 @mcp.tool()
@@ -2740,7 +3504,8 @@ async def strike_probabilities(expiration: Optional[str] = None, zero_dte: bool 
     pass `strikes` as a comma list to target specific ones.
     """
     try:
-        ch = await _load_chain()
+        ch = await _load_chain_smart(zero_dte=zero_dte,     # B3: RH-live primary, was CBOE-only
+                                     expiration=(None if zero_dte else expiration), root=root)
     except EdgeError as exc:
         return {"error": str(exc)}
     spot = ch["spot"]
@@ -2790,8 +3555,10 @@ async def strike_probabilities(expiration: Optional[str] = None, zero_dte: bool 
             d2k = (np.log(spot / k) + (RISK_FREE - 0.5 * ivk * ivk) * T) / (ivk * sqrtT)
             p_beyond = float(_norm_cdf(np.array([d2k if k >= spot else -d2k]))[0])  # P(S_T past K)
             row["probTouch%"] = round(min(1.0, 2.0 * p_beyond) * 100.0, 1)
+        elif abs(k - spot) <= 1e-6:
+            row["probTouch%"] = 100.0     # spot is AT this strike -> already touched
         else:
-            row["probTouch%"] = 100.0
+            row["probTouch%"] = None      # B15: no IV for this strike -> unknown, not a bogus 100%
         for side in ("C", "P"):
             o = by[k].get(side)
             if not o:
@@ -2799,11 +3566,16 @@ async def strike_probabilities(expiration: Optional[str] = None, zero_dte: bool 
             iv = o["iv"]
             d2 = (np.log(spot / k) + (RISK_FREE - 0.5 * iv * iv) * T) / (iv * sqrtT)
             p_itm = float(_norm_cdf(np.array([d2 if side == "C" else -d2]))[0])
+            # (#9) BS delta from the strike's IV, not the feed's delta -- one code path, consistent
+            # across RH/CBOE and immune to the B4 zero-delta feed case.
+            d1 = d2 + iv * sqrtT
+            bs_delta = float(_norm_cdf(np.array([d1]))[0]) - (1.0 if side == "P" else 0.0)
             row[side] = {"probITM%": round(100.0 * p_itm, 1),
-                         "delta": round(o.get("delta", 0.0), 3), "iv": round(iv, 4)}
+                         "delta": round(bs_delta, 3), "iv": round(iv, 4)}
         rows.append(row)
     return {"root": root.upper(), "expiration": resolved, "spot": round(spot, 2),
-            "asof": ch.get("asof"), "strikes": rows}
+            "asof": ch.get("asof"), "source": ch.get("source"), "freshness": ch.get("freshness"),
+            "strikes": rows}
 
 
 @mcp.tool()
@@ -2824,7 +3596,10 @@ async def daily_game_plan(root: str = "SPXW") -> dict:
     if not opts:
         exp = _nearest_expiry(ch["options"], root)
         opts = _filter(ch["options"], root=root, expiration=exp)
-        resolved, note = exp, f"Nothing expires today; using nearest expiry {exp}."
+        resolved = exp
+        note = (f"*** NOT TODAY'S MAP *** Nothing expires today, so EVERY level below -- gamma "
+                f"flip, call/put walls, max pain, expected move -- belongs to the {exp} expiry, "
+                f"not today's. Do NOT trade 0DTE against these levels.")
     comp = _gex_components(spot, opts)
     if not comp:
         return {"error": "No valid contracts (need OI and IV)."}
@@ -2833,7 +3608,8 @@ async def daily_game_plan(root: str = "SPXW") -> dict:
     cw = max(({k: v for k, v in call.items() if k >= spot}).items(), key=lambda kv: kv[1], default=None)
     pw = max(({k: v for k, v in put.items() if k <= spot}).items(), key=lambda kv: kv[1], default=None)
     mp = _max_pain(opts)
-    em = _em_levels(spot, opts, None if resolved == "today" else resolved)
+    # B11: pass today's date on a 0DTE map so ivBasedMovePts still computes (was None -> disabled).
+    em = _em_levels(spot, opts, _today_et().isoformat() if resolved == "today" else resolved)
     # high open-interest strikes by side
     oi_c = sorted(((o["strike"], o["oi"]) for o in opts if o["cp"] == "C" and o["oi"] > 0),
                   key=lambda x: x[1], reverse=True)[:3]
@@ -2883,7 +3659,8 @@ def _next_earnings_sync(symbol: str) -> Optional[dict]:
     import robin_stocks.robinhood as rh
     _rh_login_sync()
     try:
-        e = rh.stocks.get_earnings(symbol) or []
+        with _RH_SYNC_SEM:                      # (#11e) cap concurrent RH fan-out
+            e = rh.stocks.get_earnings(symbol) or []
     except Exception:  # noqa: BLE001
         return None
     today = _today_et()
@@ -3003,8 +3780,14 @@ async def covered_call_manager(
             "signal": sig, "earningsRisk": earn_flag,
         })
     rows.sort(key=lambda r: (r["dte"] if r["dte"] is not None else 9999))
-    return {"shortCalls": len(shorts), "totalPremiumCaptured$": round(tot_prem, 2),
-            "rollThresholds": {"delta": roll_delta, "dte": roll_dte}, "positions": rows}
+    out = {"shortCalls": len(shorts), "totalPremiumCaptured$": round(tot_prem, 2),
+           "rollThresholds": {"delta": roll_delta, "dte": roll_dte}, "positions": rows}
+    if any((r["dte"] is not None and r["dte"] <= 2 and r["annYieldOnPremium%"] is not None)
+           for r in rows):
+        out["yieldNote"] = ("annYieldOnPremium% annualizes by 365/DTE, so it balloons on very "
+                            "short-dated calls (<=2 DTE) - read it as a comparison ratio, not an "
+                            "achievable annual return.")     # B15
+    return out
 
 
 @mcp.tool()
@@ -3316,14 +4099,9 @@ async def discipline_backtest(lookback_days: Annotated[int, Field(ge=5, le=400)]
     stop = _today_et() - _dt.timedelta(days=lookback_days)
     stop_iso = stop.isoformat()
     try:
-        orders = await asyncio.to_thread(_rh_recent_option_orders, stop, 30)
+        fills_by_day, ometa = await _fills_window(stop, _today_et())   # (#3) DB-first
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
-    fills_by_day = defaultdict(list)
-    for o in orders:
-        f = _order_to_fill(o)
-        if f and f["trade_date"] >= stop_iso:
-            fills_by_day[f["trade_date"]].append(f)
     if not fills_by_day:
         return {"note": f"No fills in the last {lookback_days} days.", "target$": tgt}
 
@@ -3367,7 +4145,7 @@ async def discipline_backtest(lookback_days: Annotated[int, Field(ge=5, le=400)]
     gl = -sum(t["pnl"] for t in losses)
     n = len(all_trips)
     delta = hypo_total - actual_total
-    return {
+    out = {
         "window": f"{stop_iso} -> {_today_et().isoformat()} ({lookback_days}d)",
         "target$": round(tgt, 2), "tradingDays": len(days),
         "actualRealized$": round(actual_total, 2),
@@ -3392,6 +4170,11 @@ async def discipline_backtest(lookback_days: Annotated[int, Field(ge=5, le=400)]
                    for k in sorted(hour)},
         "equityCurve": equity,
     }
+    if ometa.get("truncated"):
+        out["dataWarning"] = (f"Order history hit the page cap (~{ometa.get('pages')} pages); this "
+                              f"window may not reach the full {lookback_days} days. Oldest seen: "
+                              f"{ometa.get('oldestSeen')}.")
+    return out
 
 
 # ============================================================================
@@ -3411,14 +4194,12 @@ async def tax_summary(year: Optional[int] = None) -> dict:
     yr = int(year) if year else _today_et().year
     jan1 = _dt.date(yr, 1, 1)
     try:
-        orders = await asyncio.to_thread(_rh_recent_option_orders, jan1, 40)
+        orders, ometa = await asyncio.to_thread(_rh_recent_option_orders, jan1, 40)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     fills = []
     for o in orders:
-        f = _order_to_fill(o)
-        if f:
-            fills.append(f)
+        fills.extend(_order_to_fills(o))    # B2: include multi-leg spread/roll legs
     fills.sort(key=lambda r: r["time"])
     trips = _round_trips(fills)
     yr_trips = [t for t in trips if t["close"].astimezone(ET).year == yr]
@@ -3447,7 +4228,7 @@ async def tax_summary(year: Optional[int] = None) -> dict:
                              "loss$": round(t["pnl"], 2),
                              "reopenDate": ot.astimezone(ET).date().isoformat()})
                 break
-    return {
+    out = {
         "year": yr, "asof": _today_et().isoformat(), "scope": "Robinhood options only (not tax advice)",
         "realizedTotal$": round(sum(t["pnl"] for t in yr_trips), 2),
         "shortTerm$": round(sum(t["pnl"] for t in st), 2), "shortTermTrips": len(st),
@@ -3463,6 +4244,11 @@ async def tax_summary(year: Optional[int] = None) -> dict:
                          "expected. Different strikes/expiries may still warrant CPA review under the "
                          "substantially-identical rule. Stock lots are not included."),
     }
+    if ometa.get("truncated"):
+        out["WARNING_TRUNCATED"] = ("Order history hit the page cap before reaching Jan 1, so this "
+                                    "year's realized P&L is INCOMPLETE - do not file from it as-is.")
+        out["dataBeginsAt"] = ometa.get("oldestSeen")
+    return out
 
 
 # ============================================================================
@@ -3481,6 +4267,18 @@ def _db_conn():
         put_wall REAL, max_pain REAL, expected_move REAL, vix REAL, vix1d REAL,
         regime TEXT, regime_score INTEGER)""")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_snap_date ON snapshots(date)")
+    # (#3) Local persistence of option fills + daily session scorecards, so weekly_review /
+    # discipline_backtest / tax_summary can read history from disk and page RH only for days not yet
+    # ingested (idempotent by fid). 'ingested_days' records which PAST dates are fully captured.
+    conn.execute("""CREATE TABLE IF NOT EXISTS fills (
+        fid TEXT PRIMARY KEY, order_id TEXT, trade_date TEXT, time_iso TEXT, chain TEXT,
+        option_id TEXT, side TEXT, effect TEXT, strike REAL, cp TEXT, expiry TEXT, price REAL,
+        qty REAL, net_cf REAL, n_legs INTEGER, leg_fallback INTEGER)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_fills_date ON fills(trade_date)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+        date TEXT PRIMARY KEY, realized REAL, fee_inclusive REAL, fees REAL, trips INTEGER,
+        cross_time TEXT, verdict TEXT, updated TEXT)""")
+    conn.execute("CREATE TABLE IF NOT EXISTS ingested_days (date TEXT PRIMARY KEY)")
     return conn
 
 
@@ -3504,6 +4302,128 @@ def _snapshot_read_sync(date_iso: str) -> list:
     return rows
 
 
+# ---- (#3) fills / sessions persistence -------------------------------------------------------
+def _fid(f: dict) -> str:
+    return f"{f.get('order_id')}|{f.get('option_id')}|{f.get('effect')}|{f.get('side')}"
+
+
+def _fill_to_row(f: dict) -> tuple:
+    return (_fid(f), f.get("order_id"), f.get("trade_date"),
+            (f["time"].isoformat() if f.get("time") is not None else None),
+            f.get("chain"), f.get("option_id"), f.get("side"), f.get("effect"),
+            f.get("strike"), f.get("cp"), f.get("expiry"), f.get("price"),
+            f.get("qty"), f.get("net_cf"), f.get("n_legs"),
+            1 if f.get("legFallback") else 0)
+
+
+def _row_to_fill(r: dict) -> dict:
+    t = None
+    if r.get("time_iso"):
+        try:
+            t = _dt.datetime.fromisoformat(r["time_iso"])
+        except Exception:  # noqa: BLE001
+            t = None
+    out = {"time": t, "trade_date": r.get("trade_date"), "chain": r.get("chain"),
+           "option_id": r.get("option_id"), "side": r.get("side"), "effect": r.get("effect"),
+           "strike": r.get("strike"), "cp": r.get("cp"), "expiry": r.get("expiry"),
+           "price": r.get("price"), "qty": r.get("qty"), "net_cf": r.get("net_cf"),
+           "n_legs": r.get("n_legs"), "order_id": r.get("order_id")}
+    if r.get("leg_fallback"):
+        out["legFallback"] = True
+    return out
+
+
+def _ingest_fills_and_mark_sync(fills: list, complete_dates: list) -> int:
+    """Idempotent upsert of fills (INSERT OR REPLACE by fid) plus marking fully-captured PAST days."""
+    conn = _db_conn()
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [_fill_to_row(f) for f in fills])
+        if complete_dates:
+            conn.executemany("INSERT OR IGNORE INTO ingested_days VALUES (?)",
+                             [(d,) for d in complete_dates])
+    conn.close()
+    return len(fills)
+
+
+def _fills_read_range_sync(start_iso: str, end_iso: str) -> list:
+    conn = _db_conn()
+    cur = conn.execute("SELECT * FROM fills WHERE trade_date BETWEEN ? AND ? ORDER BY time_iso",
+                       (start_iso, end_iso))
+    cols = [c[0] for c in cur.description]
+    rows = [_row_to_fill(dict(zip(cols, r))) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def _ingested_days_sync() -> set:
+    conn = _db_conn()
+    cur = conn.execute("SELECT date FROM ingested_days")
+    out = {r[0] for r in cur.fetchall()}
+    conn.close()
+    return out
+
+
+def _session_upsert_sync(row: dict) -> None:
+    conn = _db_conn()
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions VALUES "
+            "(:date,:realized,:fee_inclusive,:fees,:trips,:cross_time,:verdict,:updated)", row)
+    conn.close()
+
+
+def _sessions_read_range_sync(start_iso: str, end_iso: str) -> list:
+    conn = _db_conn()
+    cur = conn.execute("SELECT * FROM sessions WHERE date BETWEEN ? AND ? ORDER BY date",
+                       (start_iso, end_iso))
+    cols = [c[0] for c in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+async def _fills_window(start: "_dt.date", end: "_dt.date"):
+    """(#3) Return ({trade_date: [fills]}, meta) for [start,end]: read the local store for days already
+    ingested, and page RH ONCE for the window only when some day isn't captured yet (or the range
+    includes today, which is never marked complete). Any DB error degrades to a single live pull, so
+    this never behaves worse than the pre-cache path."""
+    import asyncio
+    from collections import defaultdict
+    today = _today_et()
+    s_iso, e_iso = start.isoformat(), end.isoformat()
+    all_days = [start + _dt.timedelta(days=i) for i in range((end - start).days + 1)]
+    past_days = [d for d in all_days if d < today]
+    by = defaultdict(list)
+    try:
+        ingested = await asyncio.to_thread(_ingested_days_sync)
+    except Exception:  # noqa: BLE001
+        ingested = set()
+    need_live = (end >= today) or any(d.isoformat() not in ingested for d in past_days)
+    if not need_live:
+        try:
+            for f in await asyncio.to_thread(_fills_read_range_sync, s_iso, e_iso):
+                by[f["trade_date"]].append(f)
+            return by, {"source": "cache", "truncated": False}
+        except Exception:  # noqa: BLE001
+            by = defaultdict(list)   # fall through to a live pull
+    orders, ometa = await asyncio.to_thread(_rh_recent_option_orders, start, 40)
+    fills = []
+    for o in orders:
+        for f in _order_to_fills(o):
+            if s_iso <= f["trade_date"] <= e_iso:
+                fills.append(f)
+                by[f["trade_date"]].append(f)
+    try:
+        # only mark past days complete when the whole window was covered (not truncated)
+        complete = [] if ometa.get("truncated") else [d.isoformat() for d in past_days]
+        await asyncio.to_thread(_ingest_fills_and_mark_sync, fills, complete)
+    except Exception:  # noqa: BLE001
+        pass
+    return by, {"source": "live", "truncated": ometa.get("truncated")}
+
+
 @mcp.tool()
 async def snapshot_log() -> dict:
     """Capture the current 0DTE state (spot, total GEX, gamma flip, call/put walls, max-pain, expected
@@ -3513,6 +4433,10 @@ async def snapshot_log() -> dict:
     levels drifted (GEX migration). Stored at ~/.trading/traders_edge.db.
     """
     import asyncio
+    # NOTE (B15): this calls the @mcp.tool()-decorated coroutines directly. Under FastMCP >= 3 the
+    # decorator returns the underlying function unchanged, so this works; on FastMCP 2.x it returned
+    # a Tool wrapper and these calls would raise. requirements.txt pins fastmcp>=3.4.0 -- keep it.
+    # freshness-lint: exempt -- the "spot" written below is a PERSISTED DB row, not tool output.
     z, vx, rg = await asyncio.gather(zero_dte_exposure(), vix_complex(), regime_classifier(),
                                      return_exceptions=True)
     if isinstance(z, Exception) or (isinstance(z, dict) and "error" in z):
@@ -3583,6 +4507,7 @@ async def snapshot_history(date: Optional[str] = None) -> dict:
         return {"first": nums[0], "last": nums[-1], "min": min(nums), "max": max(nums),
                 "change": round(nums[-1] - nums[0], 2)}
 
+    # freshness-lint: exempt -- these are HISTORICAL snapshot rows; freshness is each row's own ts.
     fmt = [{"t": (r["ts"][11:19] if r["ts"] else None), "spot": r["spot"], "gex": r["total_gex"],
             "flip": r["gamma_flip"], "callWall": r["call_wall"], "putWall": r["put_wall"],
             "vix": r["vix"], "regime": r["regime"]} for r in rows]
@@ -3728,11 +4653,11 @@ def _safe_dict(x):
 async def _recent_session_summary():
     import asyncio
     from collections import defaultdict
-    orders = await asyncio.to_thread(_rh_recent_option_orders, _today_et() - _dt.timedelta(days=7), 8)
+    orders, _ometa = await asyncio.to_thread(
+        _rh_recent_option_orders, _today_et() - _dt.timedelta(days=7), 8)
     by = defaultdict(list)
     for o in orders:
-        f = _order_to_fill(o)
-        if f:
+        for f in _order_to_fills(o):        # B2
             by[f["trade_date"]].append(f)
     if not by:
         return None
@@ -3777,6 +4702,7 @@ async def morning_brief() -> dict:
         "regime": {"label": rg.get("regime"), "score": rg.get("compositeScore"),
                    "posture": rg.get("posture")},
         "levels": {"spot": z.get("spot"), "asof": z.get("asof"),
+                   "source": z.get("source"), "freshness": z.get("freshness"),   # (#1)
                    "expectedMovePts": em.get("expectedMovePts"), "expectedMovePct": em.get("expectedMovePct"),
                    "gammaFlip": z.get("gammaFlip"), "spotVsFlip": z.get("spotVsFlip"),
                    "callWall": cw.get("strike"), "putWall": pw.get("strike"),
@@ -3804,28 +4730,46 @@ async def eod_wrap() -> dict:
     score the day and capture closing state.
     """
     import asyncio
+    # daily_review / should_i_trade / snapshot_log each `import robin_stocks` inside their own
+    # to_thread worker. On a COLD process three simultaneous first-imports trip CPython's
+    # module-lock deadlock detector (_DeadlockError) -- and eod_wrap is a plausible first call
+    # right after a server restart. Warm the import on one thread so the gather finds it cached.
+    try:
+        await asyncio.to_thread(__import__, "robin_stocks.robinhood")
+    except Exception:  # noqa: BLE001 -- if it's genuinely missing, surfaces downstream as EdgeError
+        pass
     dr, sit, snap = await asyncio.gather(daily_review(), should_i_trade(), snapshot_log(),
                                          return_exceptions=True)
     dr, sit, snap = _safe_dict(dr), _safe_dict(sit), _safe_dict(snap)
     out = {"date": _today_et().isoformat()}
-    if "pnl$" in dr:
-        out["result"] = {"realized$": dr.get("pnl$"), "trips": dr.get("trades"),
-                         "winRate%": dr.get("winRate%"), "targetHitAt": dr.get("targetHitAt"),
-                         "beforeTarget": dr.get("beforeTarget"), "afterTarget": dr.get("afterTarget")}
+    # daily_review emits realized$ / roundTrips and nests the target split under
+    # beforeVsAfterTarget. Read THOSE names: pnl$ / trades / targetHitAt are a stale
+    # daily_review schema, so "pnl$" was never present -- every session fell through to
+    # "no fills today" and the give-back leak note below was unreachable.
+    bva = dr.get("beforeVsAfterTarget") or {}
+    hit_at = bva.get("targetHitAt")
+    after = bva.get("afterTarget") or {}
+    realized = dr.get("realized$")
+    if dr.get("error"):
+        # An upstream failure (dropped RH session, etc.) must never look like a flat day.
+        out["result"] = {"error": dr["error"],
+                         "note": "daily_review failed - P&L UNKNOWN, not a no-trade day."}
+    elif realized is not None:
+        out["result"] = {"realized$": realized, "trips": dr.get("roundTrips"),
+                         "winRate%": dr.get("winRate%"), "targetHitAt": hit_at,
+                         "beforeTarget": bva.get("beforeTarget"), "afterTarget": after or None}
     else:
-        out["result"] = {"note": dr.get("note") or dr.get("error") or "no fills today"}
+        out["result"] = {"note": dr.get("note") or "no fills today"}
     tgt = _target()
-    realized = dr.get("pnl$")
-    after = (dr.get("afterTarget") or {})
     notes = []
-    if dr.get("targetHitAt"):
+    if hit_at:
         ap = after.get("pnl$")
         if ap is not None and ap < 0:
-            notes.append(f"Hit target at {dr['targetHitAt']}, then gave back ${ap:.2f} after - the leak pattern.")
+            notes.append(f"Hit target at {hit_at}, then gave back ${abs(ap):.2f} after - the leak pattern.")
         elif ap is not None and ap > 0:
-            notes.append(f"Hit target at {dr['targetHitAt']} and added ${ap:.2f} after.")
+            notes.append(f"Hit target at {hit_at} and added ${ap:.2f} after.")
         else:
-            notes.append(f"Hit target at {dr['targetHitAt']}.")
+            notes.append(f"Hit target at {hit_at}.")
     elif realized is not None:
         notes.append(f"Target ${tgt:.0f} not reached (realized ${realized:.2f}).")
     out["discipline"] = {"verdict": sit.get("verdict"), "notes": notes}
@@ -3833,11 +4777,63 @@ async def eod_wrap() -> dict:
         s = snap.get("snapshot") or {}
         out["closingLevels"] = {"spot": s.get("spot"), "gammaFlip": s.get("gamma_flip"),
                                 "callWall": s.get("call_wall"), "putWall": s.get("put_wall"),
-                                "vix": s.get("vix"), "regime": s.get("regime")}
+                                "vix": s.get("vix"), "regime": s.get("regime"),
+                                "source": "closing snapshot",                     # (#1)
+                                "freshness": {"asof": out["date"], "note": "session close"}}
         out["snapshotLogged"] = True
     else:
         out["snapshotLogged"] = False
+    # (#3) Persist the session scorecard + today's fills so weekly_review / discipline_backtest can
+    # read history from disk instead of re-paging RH (and it survives RH endpoint drift). Today is
+    # NOT marked "complete" here -- it gets ingested as a past day on the next window pull.
+    try:
+        import asyncio
+        await asyncio.to_thread(_session_upsert_sync, {
+            "date": out["date"], "realized": realized, "fee_inclusive": None, "fees": None,
+            "trips": dr.get("roundTrips"), "cross_time": hit_at, "verdict": sit.get("verdict"),
+            "updated": _dt.datetime.now(ET).isoformat()})
+        _by, _m = await _fills_window(_today_et(), _today_et())
+        out["persisted"] = {"session": True, "fillDays": len(_by), "source": _m.get("source")}
+    except Exception as _exc:  # noqa: BLE001
+        out["persisted"] = {"error": str(_exc)[:120]}
     return out
+
+
+@mcp.tool()
+async def session_db(action: str = "status", start: Optional[str] = None,
+                     end: Optional[str] = None) -> dict:
+    """(#3) Inspect / backfill the local SQLite session store that weekly_review and
+    discipline_backtest read from. action='status' (ingested-day count + range), 'backfill' (page RH
+    once for [start,end] and upsert, marking complete past days), or 'sessions' (read persisted daily
+    scorecards). Dates YYYY-MM-DD ET; default range = last 30 days. The store lives at TE_DB_PATH.
+    """
+    import asyncio
+    today = _today_et()
+    try:
+        s = _dt.date.fromisoformat(start) if start else (today - _dt.timedelta(days=30))
+        e = _dt.date.fromisoformat(end) if end else today
+    except ValueError:
+        return {"error": "Dates must be YYYY-MM-DD."}
+    act = (action or "status").lower()
+    if act == "status":
+        try:
+            ing = sorted(await asyncio.to_thread(_ingested_days_sync))
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {str(exc)[:140]}"}
+        return {"dbPath": TE_DB_PATH, "ingestedDayCount": len(ing),
+                "earliest": (ing[0] if ing else None), "latest": (ing[-1] if ing else None)}
+    if act == "backfill":
+        by, meta = await _fills_window(s, e)
+        return {"backfilled": {"from": s.isoformat(), "to": e.isoformat()},
+                "tradingDaysWithFills": len(by), "fills": sum(len(v) for v in by.values()),
+                "source": meta.get("source"), "truncated": meta.get("truncated")}
+    if act == "sessions":
+        try:
+            rows = await asyncio.to_thread(_sessions_read_range_sync, s.isoformat(), e.isoformat())
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {str(exc)[:140]}"}
+        return {"from": s.isoformat(), "to": e.isoformat(), "sessions": rows}
+    return {"error": f"Unknown action '{action}'. Use status | backfill | sessions."}
 
 
 @mcp.tool()
@@ -3851,12 +4847,7 @@ async def weekly_review(week_offset: Annotated[int, Field(ge=0, le=12)] = 0) -> 
     today = _today_et()
     monday = today - _dt.timedelta(days=today.weekday()) - _dt.timedelta(weeks=week_offset)
     friday = monday + _dt.timedelta(days=4)
-    orders = await asyncio.to_thread(_rh_recent_option_orders, monday, 20)
-    by = defaultdict(list)
-    for o in orders:
-        f = _order_to_fill(o)
-        if f and monday.isoformat() <= f["trade_date"] <= friday.isoformat():
-            by[f["trade_date"]].append(f)
+    by, ometa = await _fills_window(monday, friday)   # (#3) DB-first; pages RH only for new days
     days, total, alltrips = [], 0.0, []
     for d in sorted(by.keys()):
         trips = _round_trips(sorted(by[d], key=lambda r: r["time"]))
@@ -3880,6 +4871,8 @@ async def weekly_review(week_offset: Annotated[int, Field(ge=0, le=12)] = 0) -> 
         out["overUnder$"] = round(total - float(wt), 2)
     else:
         out["weeklyTargetNote"] = "No weekly_target set. Use trading_config to set one."
+    if ometa.get("truncated"):
+        out["dataWarning"] = "Order history hit the page cap; this week's totals may be incomplete."
     return out
 
 
@@ -3891,15 +4884,19 @@ async def tilt_detector(date: Optional[str] = None) -> dict:
     """
     import asyncio
     d = date or _today_et().isoformat()
-    orders = await asyncio.to_thread(_rh_recent_option_orders, _dt.date.fromisoformat(d), 10)
-    fills = [f for o in orders if (f := _order_to_fill(o)) and f["trade_date"] == d]
+    orders, ometa = await asyncio.to_thread(_rh_recent_option_orders, _dt.date.fromisoformat(d), 10)
+    fills = [f for o in orders for f in _order_to_fills(o) if f["trade_date"] == d]  # B2
     if not fills:
         return {"date": d, "note": "No fills for this session."}
     fills.sort(key=lambda r: r["time"])
-    trips = _round_trips(fills)
+    trips, tstats = _round_trips_full(fills)
+    data_warnings = _fill_data_warnings(ometa, tstats)
     if len(trips) < 4:
-        return {"date": d, "roundTrips": len(trips),
-                "note": f"Only {len(trips)} round trips - too few to assess tilt."}
+        out = {"date": d, "roundTrips": len(trips),
+               "note": f"Only {len(trips)} round trips - too few to assess tilt."}
+        if data_warnings:
+            out["dataWarnings"] = data_warnings
+        return out
     flags, ev = [], {}
     after_loss, after_win = [], []
     for i in range(1, len(trips)):
@@ -3909,7 +4906,9 @@ async def tilt_detector(date: Optional[str] = None) -> dict:
     ev["avgQtyAfterLoss"], ev["avgQtyAfterWin"] = round(al, 2), round(aw, 2)
     if aw > 0 and al > 1.25 * aw:
         flags.append(f"Revenge sizing: avg {al:.1f} contracts after a loss vs {aw:.1f} after a win.")
-    opens = sorted(tr["open"] for tr in trips)
+    # dedupe opens by opening ORDER (B2) so the several legs of one spread -- which share an open
+    # time -- don't read as zero-gap "rushing".
+    opens = sorted({(tr.get("open_order_id") or tr["open"]): tr["open"] for tr in trips}.values())
     gaps = [(opens[i] - opens[i - 1]).total_seconds() for i in range(1, len(opens))]
     if len(gaps) >= 6:
         third = len(gaps) // 3
@@ -3939,8 +4938,11 @@ async def tilt_detector(date: Optional[str] = None) -> dict:
     advice = ("Step away - multiple tilt signals present." if level in ("HIGH", "ELEVATED")
               else "One soft signal; stay disciplined." if level == "MILD"
               else "No tilt signatures detected.")
-    return {"date": d, "roundTrips": len(trips), "tiltLevel": level, "flags": flags,
-            "evidence": ev, "advice": advice}
+    out = {"date": d, "roundTrips": len(trips), "tiltLevel": level, "flags": flags,
+           "evidence": ev, "advice": advice}
+    if data_warnings:
+        out["dataWarnings"] = data_warnings
+    return out
 
 
 def _holding_sync(sym: str):
@@ -3964,43 +4966,47 @@ async def wheel_tracker(symbol: str = "ICE",
     import asyncio
     sym = symbol.upper()
     stop = _today_et() - _dt.timedelta(days=lookback_days)
-    orders = await asyncio.to_thread(_rh_recent_option_orders, stop, 40)
+    orders, ometa = await asyncio.to_thread(_rh_recent_option_orders, stop, 40)
     calls_credit = puts_credit = btc_debit = 0.0
-    sto_calls = sto_puts = 0
+    sto_calls = sto_puts = 0.0
     expiries = set()
     for o in orders:
-        f = _order_to_fill(o)
-        if not f or f["chain"] != sym:
-            continue
-        expiries.add(f.get("expiry"))
-        eff, side, cp = f.get("effect"), f.get("side"), f.get("cp")
-        ncf, q = (f.get("net_cf") or 0.0), abs(f.get("qty") or 0)
-        if eff == "open" and side == "sell":
-            if cp == "C":
-                calls_credit += ncf
-                sto_calls += q
-            elif cp == "P":
-                puts_credit += ncf
-                sto_puts += q
-        elif eff == "close" and side == "buy":
-            btc_debit += ncf
+        for f in _order_to_fills(o):        # B2: multi-leg rolls now counted leg-by-leg
+            if f.get("chain") != sym:
+                continue
+            expiries.add(f.get("expiry"))
+            eff, side, cp = f.get("effect"), f.get("side"), f.get("cp")
+            ncf, q = (f.get("net_cf") or 0.0), abs(f.get("qty") or 0)
+            if eff == "open" and side == "sell":
+                if cp == "C":
+                    calls_credit += ncf
+                    sto_calls += q
+                elif cp == "P":
+                    puts_credit += ncf
+                    sto_puts += q
+            elif eff == "close" and side == "buy":
+                btc_debit += ncf
     net_prem = calls_credit + puts_credit + btc_debit
     hold = await asyncio.to_thread(_holding_sync, sym)
     shares = hold.get("shares") or 0.0
     avg = hold.get("avgCost")
     eff_basis = (avg - net_prem / shares) if (avg and shares > 0) else None
-    return {"symbol": sym, "lookbackDays": lookback_days,
-            "netOptionPremium$": round(net_prem, 2),
-            "callPremium$": round(calls_credit, 2), "putPremium$": round(puts_credit, 2),
-            "buyToCloseCost$": round(btc_debit, 2),
-            "shortCallsSold": sto_calls, "shortPutsSold": sto_puts,
-            "expiryCyclesTraded": len([e for e in expiries if e]),
-            "shares": round(shares, 4), "avgCost$": round(avg, 2) if avg else None,
-            "currentPrice$": hold.get("price"),
-            "effectiveBasisAfterPremium$": round(eff_basis, 2) if eff_basis is not None else None,
-            "basisReductionPerShare$": round(net_prem / shares, 2) if shares > 0 else None,
-            "note": ("Net premium = call+put credits minus buy-to-close debits over the window. "
-                     "Assignment/exercise legs may post separately; verify against statements.")}
+    out = {"symbol": sym, "lookbackDays": lookback_days,
+           "netOptionPremium$": round(net_prem, 2),
+           "callPremium$": round(calls_credit, 2), "putPremium$": round(puts_credit, 2),
+           "buyToCloseCost$": round(-btc_debit, 2),   # B15: report as positive dollars paid to close
+           "shortCallsSold": int(sto_calls), "shortPutsSold": int(sto_puts),
+           "expiryCyclesTraded": len([e for e in expiries if e]),
+           "shares": round(shares, 4), "avgCost$": round(avg, 2) if avg else None,
+           "currentPrice$": hold.get("price"),
+           "effectiveBasisAfterPremium$": round(eff_basis, 2) if eff_basis is not None else None,
+           "basisReductionPerShare$": round(net_prem / shares, 2) if shares > 0 else None,
+           "note": ("Net premium = call+put credits minus buy-to-close debits over the window. "
+                    "buyToCloseCost$ is the positive dollars paid to close. Assignment/exercise legs "
+                    "may post separately; verify against statements.")}
+    if ometa.get("truncated"):
+        out["dataWarning"] = "Order history hit the page cap; the lookback may be incomplete."
+    return out
 
 
 def _write_scan_sync(symbol, opt_type, target_delta, min_dte, max_dte, n_per_expiry):
@@ -4324,10 +5330,10 @@ async def spot_blend(spy_mult: float = 10.0, basis: Optional[float] = None) -> d
     age_min = stl["ageMin"]
     spx_idx = None
     if basis is None:
-        _iq = await asyncio.to_thread(_rh_index_quote_sync, "SPX")
-        spx_idx = (_iq.get("SPX") or {}).get("value") if isinstance(_iq, dict) else None
+        # Real independent print (RH index, else E*TRADE) before the circular _auto_basis fallback.
+        spx_idx, spx_src = await _live_spx_print()
         if spx_idx and spy:
-            basis, basis_src = round(spx_idx - spy * spy_mult, 2), "rh_index (SPX print)"
+            basis, basis_src = round(spx_idx - spy * spy_mult, 2), f"{spx_src} (SPX print)"
         else:
             basis, basis_src = _auto_basis(chain_spot, asof, spy, spy_mult)
     else:
@@ -4357,7 +5363,10 @@ async def pcs_sizer(short_delta: float = 0.30, width: float = 10.0,
     nearest short_delta and the long put width points below, then reports net credit, max loss,
     breakeven, return-on-risk, and an approximate probability of profit. expiry defaults to 0DTE.
     """
-    chain = await _load_chain_smart(zero_dte=(expiry is None), expiration=expiry, root="SPXW")
+    try:
+        chain = await _load_chain_smart(zero_dte=(expiry is None), expiration=expiry, root="SPXW")
+    except EdgeError as exc:
+        return {"error": str(exc)}
     spot = chain.get("spot")
     opts = chain.get("options") or []
     exp = expiry or _nearest_expiry(opts, "SPXW")
@@ -4365,30 +5374,50 @@ async def pcs_sizer(short_delta: float = 0.30, width: float = 10.0,
             if o.get("cp") == "P" and o.get("strike")]
     if not puts:
         return {"error": f"No SPXW puts found for {exp}."}
-    with_delta = [o for o in puts if o.get("delta") is not None]
+    T = _year_frac(exp)
+
+    def _put_delta(o):
+        # B4: prefer a real feed delta, but if it is missing OR exactly 0.0 (RH's "unknown"),
+        # recompute abs(delta) from the strike's IV. The old code accepted delta==0.0 as valid,
+        # which -- when the whole feed's deltas came back 0 -- sized a nonsense short strike and
+        # reported approxPOP 100%.
+        d = o.get("delta")
+        if d is not None and abs(d) > 1e-6:
+            return abs(d)
+        iv, K = o.get("iv"), o.get("strike")
+        if iv and iv > 0 and K and spot:
+            dd, _g, _v, _c = _greeks_vec(spot, np.array([float(K)]), np.array([float(T)]),
+                                         np.array([float(iv)]), np.array([False]))
+            return abs(float(dd[0]))
+        return None
+
+    scored = [(o, _put_delta(o)) for o in puts]
+    with_delta = [(o, dl) for (o, dl) in scored if dl is not None]
     if not with_delta:
-        return {"error": "No delta data on puts."}
-    short = min(with_delta, key=lambda o: abs(abs(o["delta"]) - short_delta))
+        return {"error": "No usable delta on puts (feed delta missing/zero and no IV to recompute)."}
+    short, short_d = min(with_delta, key=lambda od: abs(od[1] - short_delta))
     ks = short["strike"]
     longs = [o for o in puts if o["strike"] <= ks - 0.01]
     if not longs:
         return {"error": "No long put strike below the short available."}
     longp = min(longs, key=lambda o: abs(o["strike"] - (ks - width)))
+    long_d = next((dl for (o, dl) in scored if o is longp), None)
     actual_width = round(ks - longp["strike"], 2)
     sc, lc = (short.get("mid") or 0.0), (longp.get("mid") or 0.0)
     credit = round(sc - lc, 2)
     maxloss = round(actual_width - credit, 2)
     return {"expiry": exp, "spot": spot,
             "source": chain.get("source"), "freshness": chain.get("freshness"),
-            "shortPut": {"strike": ks, "delta": round(short["delta"], 3), "mid": round(sc, 2)},
-            "longPut": {"strike": longp["strike"], "delta": round(longp.get("delta") or 0.0, 3),
+            "shortPut": {"strike": ks, "delta": round(short_d, 3), "mid": round(sc, 2)},
+            "longPut": {"strike": longp["strike"], "delta": round(long_d or 0.0, 3),
                         "mid": round(lc, 2)},
             "width": actual_width, "creditPerSh$": credit, "creditPerContract$": round(credit * 100, 2),
             "maxLossPerSh$": maxloss, "maxLossPerContract$": round(maxloss * 100, 2),
             "breakeven": round(ks - credit, 2),
             "returnOnRisk%": round(100 * credit / maxloss, 1) if maxloss > 0 else None,
-            "approxPOP%": round(100 * (1 - abs(short["delta"])), 1),
+            "approxPOP%": round(100 * (1 - short_d), 1),
             "note": ("approxPOP ~ P(short put expires OTM) = 1-abs(delta); true POP is a bit higher. "
+                     "Deltas are recomputed from IV when the feed's delta is missing or 0 (B4). "
                      "Feed in 'source'/'freshness': Robinhood live when market open, else CBOE ~15-min delayed.")}
 
 
@@ -4399,7 +5428,7 @@ async def event_risk_radar(days: Annotated[int, Field(ge=1, le=60)] = 7) -> dict
     single-name earnings calendars with your positions.
     """
     import asyncio
-    ec, ear, pos = await asyncio.gather(economic_calendar(), earnings_calendar(days=days),
+    ec, ear, pos = await asyncio.gather(economic_calendar(days=days), earnings_calendar(days=days),
                                         _robinhood_positions(), return_exceptions=True)
     today = _today_et()
     horizon = today + _dt.timedelta(days=days)
@@ -4413,7 +5442,15 @@ async def event_risk_radar(days: Annotated[int, Field(ge=1, le=60)] = 7) -> dict
             if today <= dd <= horizon and e.get("importance") == "high":
                 items.append({"date": e["date"], "type": "economic", "name": e.get("name"),
                               "importance": "high", "daysAway": (dd - today).days})
-    held = {p["symbol"] for p in pos if p.get("type") == "equity"} if isinstance(pos, list) else set()
+    # B6: an options trader's "held" names include the underlyings of option positions, not just
+    # outright shares -- otherwise earnings on a name you only hold via options look "unheld".
+    held = set()
+    if isinstance(pos, list):
+        for p in pos:
+            if p.get("type") == "equity" and p.get("symbol"):
+                held.add(p["symbol"])
+            elif p.get("type") == "option" and p.get("underlying"):
+                held.add(p["underlying"])
     if isinstance(ear, dict):
         for r in (ear.get("nextEarnings") or []):
             if r.get("withinWindow"):
@@ -4427,10 +5464,12 @@ async def event_risk_radar(days: Annotated[int, Field(ge=1, le=60)] = 7) -> dict
 
 @mcp.tool()
 async def estimated_tax(year: Optional[int] = None, fed_rate: float = 0.35,
-                        state_rate: float = 0.0549) -> dict:
+                        state_rate: float = 0.0499, include_niit: bool = True) -> dict:
     """Estimated tax set-aside on your realized trading gains: pulls YTD realized short/long-term options
     P&L and applies your marginal federal + Georgia rates, with a quarterly figure. Short-term is taxed
-    as ordinary income. Trading gains only - excludes W-2/Schedule C/clergy; not tax advice.
+    as ordinary income. Georgia's 2026 flat rate is 4.99% (HB 463). include_niit adds the 3.8% Net
+    Investment Income Tax (applies above ~$200k single / $250k MFJ MAGI). Trading gains only - excludes
+    W-2/Schedule C/clergy; not tax advice.
     """
     ts = await tax_summary(year=year)
     if "realizedTotal$" not in ts:
@@ -4438,17 +5477,26 @@ async def estimated_tax(year: Optional[int] = None, fed_rate: float = 0.35,
         return {**base, "note": ts.get("note") or "No realized P&L to estimate."}
     st = ts.get("shortTerm$", 0.0) or 0.0
     lt = ts.get("longTerm$", 0.0) or 0.0
-    fed_st = max(0.0, st) * fed_rate
+    niit = 0.038 if include_niit else 0.0
+    fed_st = max(0.0, st) * (fed_rate + niit)
     st_state = max(0.0, st) * state_rate
-    ltcg = max(0.0, lt) * 0.15
+    ltcg = max(0.0, lt) * (0.15 + niit)
     lt_state = max(0.0, lt) * state_rate
     total = fed_st + st_state + ltcg + lt_state
-    return {"year": ts.get("year"), "realizedShortTerm$": round(st, 2), "realizedLongTerm$": round(lt, 2),
-            "assumedFedRate": fed_rate, "assumedStateRate": state_rate,
-            "estShortTermTax$": round(fed_st + st_state, 2), "estLongTermTax$": round(ltcg + lt_state, 2),
-            "estTotalSetAside$": round(total, 2), "quarterlySetAside$": round(total / 4, 2),
-            "note": ("Trading gains only; short-term taxed as ordinary income. Excludes W-2 / Schedule C "
-                     "/ clergy housing. Verify with your CPA.")}
+    out = {"year": ts.get("year"), "realizedShortTerm$": round(st, 2), "realizedLongTerm$": round(lt, 2),
+           "assumedFedRate": fed_rate, "assumedStateRate": state_rate,
+           "niitApplied": include_niit, "niitRate": niit,
+           "estShortTermTax$": round(fed_st + st_state, 2), "estLongTermTax$": round(ltcg + lt_state, 2),
+           "estTotalSetAside$": round(total, 2), "quarterlySetAside$": round(total / 4, 2),
+           "note": ("Trading gains only; short-term taxed as ordinary income; LTCG modeled at 15% (a 20% "
+                    "bracket applies at high income). Georgia flat 4.99% (2026, HB 463). Excludes W-2 / "
+                    "Schedule C / clergy housing. This set-aside covers YTD realized gains SO FAR and "
+                    "does NOT cover the full year. Verify with your CPA.")}
+    if ts.get("WARNING_TRUNCATED"):
+        out["WARNING_TRUNCATED"] = ("Underlying order history was truncated, so realized P&L (and this "
+                                    "set-aside) is INCOMPLETE. " + str(ts.get("WARNING_TRUNCATED")))
+        out["dataBeginsAt"] = ts.get("dataBeginsAt")
+    return out
 
 
 # ============================================================================
@@ -4459,16 +5507,17 @@ _basis_cache: dict = {}   # {"basis": float, "ts": monotonic_seconds, "spot": fl
 
 
 def _market_open_et(now: Optional[_dt.datetime] = None) -> bool:
-    """True if the US equity cash session is open right now (Mon-Fri, 09:30-16:00 ET).
-    Holidays are not modeled -- a market holiday on a weekday reads as 'open'."""
+    """True if the US equity cash session is open right now (a regular trading day, 09:30 to the
+    session close ET). B8: NYSE holidays are excluded and half days close at 13:00 ET."""
     n = now or _dt.datetime.now(ET)
     if n.tzinfo is None:
         n = n.replace(tzinfo=ET)
     n = n.astimezone(ET)
-    if n.weekday() >= 5:
+    if not _is_trading_day(n.date()):
         return False
+    close_t = _session_close_et(n.date())
     mins = n.hour * 60 + n.minute
-    return (9 * 60 + 30) <= mins < (16 * 60)
+    return (9 * 60 + 30) <= mins < (close_t.hour * 60 + close_t.minute)
 
 
 def _parse_asof_et(asof: Optional[str]) -> Optional[_dt.datetime]:
@@ -4566,6 +5615,29 @@ async def feed_health() -> dict:
     out["chainSpot"] = round(chain_spot, 2) if chain_spot else None
     out["freshness"] = stl
     out["contracts"] = len(ch.get("options") or [])
+
+    # B3: the 0DTE tools now use the Robinhood LIVE chain as PRIMARY (CBOE is only the fallback),
+    # so surface RH's health here too -- otherwise feed_health can report "OK" about a feed the
+    # maps no longer lean on. Probe today's RH SPXW chain with a short timeout.
+    rh_probe: dict = {}
+    try:
+        rh_ch = await asyncio.wait_for(_rh_chain_cached(_today_et().isoformat()), timeout=12)
+        if rh_ch and rh_ch.get("options"):
+            rh_probe = {"up": True, "contracts": len(rh_ch.get("options") or []),
+                        "paritySpot": round(rh_ch["spot"], 2) if rh_ch.get("spot") else None,
+                        "verdict": "OK"}
+        elif not _is_trading_day(_today_et()):
+            rh_probe = {"up": False, "verdict": "CLOSED",
+                        "note": "Not a trading day; RH has no live 0DTE chain."}
+        else:
+            rh_probe = {"up": False, "verdict": "NO_TODAY_EXPIRY",
+                        "note": "RH returned no contracts expiring today (series may have rolled)."}
+    except asyncio.TimeoutError:
+        rh_probe = {"up": False, "verdict": "TIMEOUT", "note": "RH chain probe timed out (>12s)."}
+    except Exception as exc:  # noqa: BLE001
+        rh_probe = {"up": False, "verdict": "ERROR", "error": str(exc)[:160]}
+    out["rhChain"] = rh_probe
+
     spy = None
     try:
         spy = await asyncio.to_thread(_spy_live_sync)
@@ -4573,11 +5645,29 @@ async def feed_health() -> dict:
         spy = None
     basis, src = _auto_basis(chain_spot, ch.get("asof"), spy, 10.0)
     spx_est = round(spy * 10.0 + basis, 1) if (spy and basis is not None) else None
+    # An INDEPENDENT live SPX print is what makes this tool mean anything. Without one, the
+    # "uncalibrated" branch of _auto_basis sets basis = chainSpot - spy*10, so spxLiveEst comes
+    # out IDENTICAL to chainSpot and gapVsChainPts is identically 0.0 -- the staleness check
+    # silently reports a stale price as live (this happened 2026-07-15). Prefer a real print
+    # (Robinhood index, else E*TRADE) and be loud when neither is available.
+    spx_live, spx_src = await _live_spx_print()
+    if spx_live:
+        out["spxLive"] = spx_live
+        out["spxLiveSource"] = spx_src
+        spx_est = round(spx_live, 1)
+        if spy:
+            basis, src = round(spx_live - spy * 10.0, 2), f"{spx_src} (live SPX print)"
     out["spyLive"] = spy
     out["basis"] = basis
     out["basisSource"] = src
     out["spxLiveEst"] = spx_est
     out["gapVsChainPts"] = round(spx_est - chain_spot, 1) if (spx_est and chain_spot) else None
+    if not spx_live and src == "uncalibrated":
+        out["CANNOT_VERIFY"] = True
+        out["warning"] = ("No independent live SPX print (Robinhood index endpoint AND E*TRADE both "
+                          "unavailable) and no cached basis. spxLiveEst is derived FROM chainSpot, so "
+                          "it EQUALS chainSpot and gapVsChainPts is meaningless -- this tool cannot "
+                          "detect staleness right now. Price off your broker quote.")
     v = stl["verdict"]
     if v == "stale":
         out["verdict"] = "STALE"
@@ -4598,10 +5688,72 @@ async def feed_health() -> dict:
     if spy is None:
         out["note"] = ("Live SPY overlay unavailable (broker session) - spxLiveEst may be absent and "
                        "basis fell back to cache/none.")
+    # (#8) feed_health v2: a verdict per feed the desk actually stands on + a composite, so a green
+    # CBOE verdict can't mask a down RH-live chain (the feed the smart 0DTE tools now use as primary).
+    rhc = out.get("rhChain") or {}
+    feeds = {
+        "cboeChain": {"verdict": out.get("verdict"), "ageMin": (stl or {}).get("ageMin")},
+        "rhChain": {"verdict": rhc.get("verdict"), "contracts": rhc.get("contracts")},
+        "spxPrint": {"verdict": ("OK" if spx_live else "DOWN"), "source": spx_src, "value": spx_live},
+    }
+    rh_ok = rhc.get("verdict") == "OK"
+    cboe_ok = out.get("verdict") in ("OK", "LAGGING")
+    if rh_ok and spx_live:
+        composite = "OK"            # primary 0DTE feed live AND an independent print to check it
+    elif rh_ok or cboe_ok:
+        composite = "DEGRADED"      # a usable chain, but verification is thin
+    else:
+        composite = "DOWN"          # no trustworthy chain
+    out["feeds"] = feeds
+    out["compositeVerdict"] = composite
     return out
 
 
+def _selftest() -> int:
+    """(#11b) `python traders_edge_mcp.py --selftest` -- fast OFFLINE sanity of the plumbing before you
+    restart Claude Desktop. Pure math + fill decomposition; no network, no broker session touched."""
+    import datetime as _d
+    fails = []
+
+    def ck(name, cond):
+        print(("ok   " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    ck("norm_cdf(0)=.5", abs(float(_norm_cdf(np.array([0.0]))[0]) - 0.5) < 1e-6)
+    ck("2026-07-03 is a holiday", not _is_trading_day(_d.date(2026, 7, 3)))
+    ck("half-day close 13:00", _session_close_et(_d.date(2026, 11, 27)) == _d.time(13, 0))
+    ck("redact strips api_key", "SECRET" not in _redact_url("http://x/?api_key=SECRET"))
+
+    def _leg(oid, side, eff, k, ot, px, ts):
+        return {"option": f"x/{oid}/", "side": side, "position_effect": eff, "strike_price": str(k),
+                "option_type": ot, "expiration_date": "2026-07-20",
+                "executions": [{"timestamp": ts, "trade_date": "2026-07-20", "price": str(px),
+                                "quantity": "1"}], "ratio_quantity": "1"}
+
+    o1 = {"id": "O1", "state": "filled", "chain_symbol": "SPXW", "updated_at": "2026-07-20T14:30:00Z",
+          "created_at": "2026-07-20T14:30:00Z", "net_amount": "300", "net_amount_direction": "credit",
+          "processed_premium": None, "processed_quantity": "1", "quantity": "1",
+          "legs": [_leg("a", "sell", "open", 6800, "put", 5.0, "2026-07-20T14:30:00Z"),
+                   _leg("b", "buy", "open", 6790, "put", 2.0, "2026-07-20T14:30:00Z")]}
+    o2 = {"id": "O2", "state": "filled", "chain_symbol": "SPXW", "updated_at": "2026-07-20T15:30:00Z",
+          "created_at": "2026-07-20T15:30:00Z", "net_amount": "50", "net_amount_direction": "debit",
+          "processed_premium": None, "processed_quantity": "1", "quantity": "1",
+          "legs": [_leg("a", "buy", "close", 6800, "put", 1.0, "2026-07-20T15:30:00Z"),
+                   _leg("b", "sell", "close", 6790, "put", 0.5, "2026-07-20T15:30:00Z")]}
+    f = _order_to_fills(o1) + _order_to_fills(o2)
+    trips, _stats = _round_trips_full(f)
+    ck("spread -> 2 trips, P&L == net cash",
+       len(trips) == 2 and round(sum(t["pnl"] for t in trips), 2) == round(sum(x["net_cf"] for x in f), 2))
+    ck("mi_ratio date-aligns",
+       _mi_ratio({"d1": 10.0, "d2": 20.0, "d3": 99.0}, {"d1": 2.0, "d2": 5.0}) == [5.0, 4.0])
+    print("SELFTEST " + ("FAILED: " + ", ".join(fails) if fails else "PASSED"))
+    return 1 if fails else 0
+
+
 def main() -> None:
+    if "--selftest" in sys.argv:
+        raise SystemExit(_selftest())
     log.info("Starting Traders Edge MCP server (stdio); risk-free=%.3f", RISK_FREE)
     mcp.run()
 
@@ -4651,22 +5803,28 @@ def _rh_realized_recon_sync(date_iso: str) -> dict:
     fee-inclusive number is the one that should reconcile to Robinhood's official PnL hub.
     """
     target = _dt.date.fromisoformat(date_iso)
-    raw = _rh_recent_option_orders(target)
-    fills, fees = [], 0.0
+    raw, ometa = _rh_recent_option_orders(target)
+    fills, fees, n_orders = [], 0.0, 0
     for o in raw:
-        f = _order_to_fill(o)
-        if f and f["trade_date"] == date_iso:
-            fills.append(f)
-            fees += _rh_order_fees(o)
+        day_legs = [f for f in _order_to_fills(o) if f["trade_date"] == date_iso]   # B2
+        if day_legs:
+            fills.extend(day_legs)
+            fees += _rh_order_fees(o)                  # B7: fees counted ONCE per ORDER, not per leg
+            n_orders += 1
     fills.sort(key=lambda r: r["time"])
-    trips = _round_trips(fills)
+    trips, tstats = _round_trips_full(fills)
     rt_realized = round(sum(t["pnl"] for t in trips), 2)   # fee-less; == daily_pnl_curve realized$
     net_cf = round(sum(f["net_cf"] for f in fills), 2)
     fee_incl = round(rt_realized - fees, 2)
-    return {"date": date_iso, "orders": len(fills), "roundTrips": len(trips),
-            "roundTripRealized$": rt_realized, "fees$": round(fees, 2),
-            "feeInclusiveRealized$": fee_incl, "netCashFlow$": net_cf,
-            "openOrExpiredDelta$": round(net_cf - rt_realized, 2)}
+    out = {"date": date_iso, "orders": n_orders, "legFills": len(fills), "roundTrips": len(trips),
+           "roundTripRealized$": rt_realized, "fees$": round(fees, 2),
+           "feeInclusiveRealized$": fee_incl, "netCashFlow$": net_cf,
+           "openOrExpiredDelta$": round(net_cf - rt_realized, 2)}
+    if tstats.get("unmatchedCloses") or tstats.get("orderLevelFallback"):
+        out["reconStats"] = tstats
+    if ometa.get("truncated"):
+        out["truncated"] = True
+    return out
 
 
 def _rh_pnl_hub_sync(span: str, account_number):
@@ -4732,6 +5890,11 @@ async def realized_pnl(date: Optional[str] = None, span: Optional[str] = None,
         checks.append(f"Net cash flow (${recon['netCashFlow$']:.2f}) differs from round-trip realized "
                       f"by ${recon['openOrExpiredDelta$']:.2f} - a leg expired/assigned or is still open "
                       f"(not paired into a round trip).")
+    if recon.get("truncated"):
+        checks.append("Order history hit the page cap for this lookback - if a position opened on an "
+                      "earlier date, its close today may be unmatched. Figures may be incomplete.")
+    if recon.get("reconStats"):
+        checks.append(f"Round-trip matching flagged data-quality issues: {recon['reconStats']}.")
     if len(checks) == 0:
         checks.append("Reconstruction reconciles cleanly (no fees, no unpaired legs) for this date.")
 
@@ -4826,25 +5989,33 @@ def _rh_index_quote_sync(symbols: str) -> dict:
 
 @mcp.tool()
 async def index_quote(symbols: str = "SPX,VIX") -> dict:
-    """Live index levels (SPX / VIX / NDX) straight from Robinhood - a real-time print to de-stale the
-    ~15-min CBOE chain and calibrate the SPY->SPX basis used by spot_blend.
+    """Live index levels (SPX / VIX / NDX) - a real-time print to de-stale the ~15-min CBOE chain
+    and calibrate the SPY->SPX basis used by spot_blend and feed_health.
 
-    `symbols` is comma-separated (default 'SPX,VIX'). Values track live during RTH; outside the session
-    the print is the prior settle. Returns {SYMBOL: {value, asof}} plus the resolved instrument IDs.
+    Robinhood's index endpoint is primary; E*TRADE's market feed (independent, and it self-reports
+    quoteStatus REALTIME/DELAYED) is the fallback, so a single broken endpoint no longer leaves the
+    desk with zero live prints. `symbols` is comma-separated (default 'SPX,VIX'). Values track live
+    during RTH; outside the session the print is the prior settle.
     """
     import asyncio
+    q = {}
     try:
-        q = await asyncio.to_thread(_rh_index_quote_sync, symbols)
-    except EdgeError as exc:
-        return {"error": str(exc)}
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        q = await asyncio.to_thread(_rh_index_quote_sync, symbols) or {}
+    except Exception as exc:  # noqa: BLE001 -- fall through to E*TRADE
+        log.info("RH index quote failed (%s); trying E*TRADE", str(exc)[:140])
     if not q:
-        return {"error": ("No index quote returned. RH's index endpoint may have moved - set "
-                          "RH_INDEX_QUOTE_URL to the captured URL template ({ids}=comma-joined UUIDs)."),
+        try:
+            q = await asyncio.to_thread(_etrade_index_quote_sync, symbols) or {}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    if not q:
+        return {"error": ("No index quote from Robinhood OR E*TRADE. RH's endpoint may have moved "
+                          "(set RH_INDEX_QUOTE_URL, {ids}=comma-joined UUIDs) and the E*TRADE token "
+                          "may need re-authorizing via the etrade MCP."),
                 "triedIds": _RH_INDEX_IDS}
-    return {"indexes": q, "instrumentIds": {s: _RH_INDEX_IDS.get(s) for s in q},
-            "note": "Live from Robinhood marketdata; feeds spot_blend basis when SPX is present."}
+    return {"indexes": q, "source": next(iter(q.values())).get("source"),
+            "instrumentIds": {s: _RH_INDEX_IDS.get(s) for s in q if _RH_INDEX_IDS.get(s)},
+            "note": "Live index print; feeds the spot_blend / feed_health basis when SPX is present."}
 
 
 # ---- Watchlist radar: run the catalyst analytics across a named RH watchlist ----
@@ -5382,6 +6553,12 @@ def _mi_sma(series, window):
 
 
 def _mi_ratio(num, den):
+    # B15: when given {date: close} dicts, align on the INTERSECTION of dates (sorted) so we never
+    # divide one series' Friday close by the other's Thursday close when their histories differ.
+    # Falls back to the legacy positional tail-align for plain lists.
+    if isinstance(num, dict) and isinstance(den, dict):
+        common = sorted(set(num) & set(den))
+        return [num[d] / den[d] for d in common if den[d] != 0]
     n = min(len(num), len(den))
     num, den = num[-n:], den[-n:]
     return [a / b for a, b in zip(num, den) if b != 0]
@@ -5473,8 +6650,15 @@ def _cross_asset_macro(closes_by, yield_spread=None, spread_source="none",
     spy = closes_by.get("SPY"); tlt = closes_by.get("TLT")
     spy_tlt_corr = None
     if spy and tlt:
-        rs = _mi_pct_returns(spy[-(corr_win + 1):])
-        rt = _mi_pct_returns(tlt[-(corr_win + 1):])
+        if isinstance(spy, dict) and isinstance(tlt, dict):
+            common = sorted(set(spy) & set(tlt))[-(corr_win + 1):]   # B15: date-aligned returns
+            spy_ser = [spy[d] for d in common]
+            tlt_ser = [tlt[d] for d in common]
+        else:
+            spy_ser = spy[-(corr_win + 1):]
+            tlt_ser = tlt[-(corr_win + 1):]
+        rs = _mi_pct_returns(spy_ser)
+        rt = _mi_pct_returns(tlt_ser)
         spy_tlt_corr = _mi_pearson(rs, rt)
 
     avail = [c for c in comps.values() if c["available"] and c["signal"] is not None]
@@ -5575,7 +6759,10 @@ async def market_internals(yield_spread: Optional[float] = None) -> dict:
             spread, spread_source, spread_latest = await asyncio.to_thread(_mi_yield_spread_sync)
         except Exception:  # noqa: BLE001
             spread, spread_source, spread_latest = None, "unavailable", None
-    closes_map = {s: _ordered_closes(closes_by, s) for s in _MI_ETFS}
+    # B15: pass the raw {date: close} dicts (NOT positional lists) so the ratio and SPY-TLT
+    # correlation align on shared dates. _ordered_closes dropped the dates, which let a series with
+    # a missing/extra day pair mismatched closes and skew every internals signal.
+    closes_map = {s: ((closes_by or {}).get(s) or {}) for s in _MI_ETFS}
     try:
         res = await asyncio.to_thread(_cross_asset_macro, closes_map, spread, spread_source)
     except EdgeError as exc:
