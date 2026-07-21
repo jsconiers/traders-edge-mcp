@@ -3315,7 +3315,12 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     late_et = str(_cfg("late_session_et"))
     is_today = (d == _today_et().isoformat())
     try:
-        fills = await _day_fills(d)
+        # _day_fills returns (fills, meta) -- the meta feeds _fill_data_warnings below (line ~3332)
+        # so the gate never clears to GO on an incomplete fill picture. Unpacking to just `fills`
+        # handed the (list, dict) tuple straight into _round_trips_full, which iterated it, hit the
+        # dict, and raised "'list' object has no attribute 'get'". daily_review/eod_wrap already
+        # unpack both; this line had drifted.
+        fills, fmeta = await _day_fills(d)
     except EdgeError as exc:
         return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001
