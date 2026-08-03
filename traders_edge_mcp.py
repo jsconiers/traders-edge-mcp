@@ -2943,6 +2943,18 @@ def _rh_recent_option_orders(stop_date: _dt.date, max_pages: int = 12, page_size
     url = f"{base}{sep}page_size={int(page_size)}"
     out, page, oldest_d = [], 0, None
     data = rh.helper.request_get(url, "regular")
+    if not isinstance(data, dict):
+        # An AUTHENTICATED request always returns a dict (with a possibly-empty 'results').
+        # request_get returns None on 401/transport failure -- and the old code let that fall
+        # straight through the while-loop to `return [], ...`, reporting ZERO ORDERS instead of
+        # an error. That is how a +$566.64 trading day was reported as $0.00 realized on
+        # 2026-08-03, leaving the discipline gate blind and stuck on GO. Never again: an
+        # unreadable ledger must raise, so callers report UNKNOWN rather than a confident zero.
+        raise EdgeError(
+            "Cannot read Robinhood order history - the session is expired or unreachable, so "
+            "P&L is UNKNOWN (this is NOT a no-trade day). Re-auth in Terminal: "
+            "rm -f ~/.robinhood/robinhood.pickle && cd <your robinhood-mcp dir> && "
+            "python3 -c 'import robinhood_mcp_v2 as m; m._login()'  then restart Claude Desktop.")
     while data and isinstance(data, dict):
         results = data.get("results", []) or []
         out.extend(results)
@@ -3321,10 +3333,18 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
         # dict, and raised "'list' object has no attribute 'get'". daily_review/eod_wrap already
         # unpack both; this line had drifted.
         fills, fmeta = await _day_fills(d)
-    except EdgeError as exc:
-        return {"error": str(exc)}
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    except (EdgeError, Exception) as exc:  # noqa: BLE001 -- a blind gate must fail SAFE, not open
+        # Return a real blocking verdict, not a bare {"error": ...}. A caller (human or model)
+        # skimming for `verdict` must never find GO -- or an absent one -- while the ledger is
+        # unreadable, which is exactly how 2026-08-03 ran all day on a stale gate.
+        msg = str(exc) if isinstance(exc, EdgeError) else f"{type(exc).__name__}: {str(exc)[:160]}"
+        return {"date": d, "verdict": "UNKNOWN", "flags": ["FILLS_UNREADABLE"],
+                "realized$": None, "peak$": None, "target$": tgt, "roundTrips": None,
+                "error": msg,
+                "reasons": ["P&L is UNKNOWN - the fill ledger could not be read. This is NOT a "
+                            "no-trade day and NOT a clearance to trade. Treat your daily floor "
+                            "and target as MANUAL until this is fixed."],
+                "asof": _dt.datetime.now(ET).strftime("%H:%M:%S ET")}
     now = _dt.datetime.now(ET)
     trips, tstats = _round_trips_full(fills)
     cur = _build_curve(trips, tgt)
