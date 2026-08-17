@@ -3,6 +3,43 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses semantic versioning.
 
+## [Unreleased]
+
+### Fixed — B16: the discipline gate was measuring gross dollars against a net target
+
+- **`should_i_trade`** ran on the fee-less FIFO round-trip sum while `daily_target` and
+  `realized_pnl` had always used `feeInclusiveRealized$`. Robinhood options are commission-free but
+  pass a per-contract regulatory fee, so the two figures diverge by roughly $4 per round trip — and
+  the gate compared the larger one against a net target. On 2026-08-17 it returned
+  `STOP / PAST_TARGET` at $556.68 gross when the authoritative figure was $523.36, i.e. **64 cents
+  short** of the $524 target. 2026-08-13 had the same signature ($557.76 gross / $521.52 net).
+  The error scales with trip count (~$67 on a 16-trip day), so it was largest on exactly the
+  high-trip sessions the logged history flags as the losing profile.
+- **`_day_fills_sync`** now totals the day's regulatory/exchange fees into `meta["fees$"]`, counted
+  once per *order* (cf. B7) and only for orders that contributed a fill on that date — computed off
+  orders already being paged, so the gate runs on net P&L without a second Robinhood round trip.
+- **`_apply_fees`** allocates that total back onto individual round trips pro-rata by contract
+  quantity. Because the fee is per-contract this is the correct model, not an approximation: the
+  total is exact and only the intraday *timing* of the drag is smoothed. `_build_curve` therefore
+  yields a genuine net running curve, so the give-back/peak test is net-to-net rather than a mixed
+  comparison. Fees on legs still open at call time spread across completed trips, biasing the
+  running net mildly conservative — the correct direction of error for this gate.
+- **`strict` cross-check** now reconciles against `feeInclusiveRealized$`. Left on the fee-less
+  figure it would have disagreed by exactly the day's fees on every call and raised
+  `DATA_INCOMPLETE` on a healthy tape.
+
+### Added
+
+- **`NEAR_TARGET` verdict band** (`near_target_frac`, default `0.90`; env `TE_NEAR_TARGET_FRAC`).
+  Moving the gate gross → net makes it fire *later*, i.e. strictly more permissive: the gross bug
+  had been supplying an accidental buffer. `NEAR_TARGET` restores that margin deliberately, mapping
+  to `CAUTION` rather than `GO` once net P&L reaches 90% of target. Both 2026-08-17 and 2026-08-13
+  now return `CAUTION` instead of a false `STOP`.
+- `should_i_trade` reports `realizedGross$` and `fees$` alongside `realized$` (now net), so a reason
+  string can never again quote one basis while the verdict is computed on the other.
+- `daily_pnl_curve` reports `fees$` and `realizedNet$`; its curve stays gross for session-store
+  continuity with existing history.
+
 ## [0.10.0] - 2026-07-03
 
 ### Added — 2 tools (68 -> 70), local technical engine

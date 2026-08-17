@@ -3060,19 +3060,29 @@ def _order_to_fills(o: dict) -> list:
 
 
 def _day_fills_sync(date_iso: str):
-    """B2/B7: returns (fills, meta). fills now include per-leg records for multi-leg orders."""
+    """B2/B7: returns (fills, meta). fills now include per-leg records for multi-leg orders.
+
+    B16: also totals the day's RH regulatory/exchange fees into meta["fees$"], counted ONCE per
+    ORDER (cf. B7) and only for orders that actually contributed a fill on this date. This is the
+    same accounting _rh_realized_recon_sync uses, computed off orders we are ALREADY paging -- so
+    the discipline gate can run on NET P&L without a second round trip to Robinhood.
+    """
     target = _dt.date.fromisoformat(date_iso)
     orders, ometa = _rh_recent_option_orders(target)
-    fills, leg_fallbacks = [], 0
+    fills, leg_fallbacks, fees = [], 0, 0.0
     for o in orders:
-        for f in _order_to_fills(o):
-            if f.get("trade_date") == date_iso:
-                if f.get("legFallback"):
-                    leg_fallbacks += 1
-                fills.append(f)
+        day_legs = [f for f in _order_to_fills(o) if f.get("trade_date") == date_iso]
+        if not day_legs:
+            continue
+        fees += _rh_order_fees(o)
+        for f in day_legs:
+            if f.get("legFallback"):
+                leg_fallbacks += 1
+            fills.append(f)
     fills.sort(key=lambda r: r["time"])
     meta = dict(ometa)
     meta["legFallback"] = leg_fallbacks
+    meta["fees$"] = round(fees, 2)
     return fills, meta
 
 
@@ -3120,6 +3130,31 @@ def _build_curve(trips: list, target: float) -> dict:
                      "pnl$": round(t["pnl"], 2), "cum$": round(cum, 2)})
     return {"rows": rows, "total": cum, "peak": peak, "maxDrawdownFromPeak": abs(max_dd),
             "crossIdx": cross_i, "crossCum": cross_cum, "crossTime": cross_time}
+
+
+def _apply_fees(trips: list, fees: float) -> list:
+    """B16: charge RH per-contract regulatory fees back onto the round trips that incurred them.
+
+    RH options are commission-free but pass a PER-CONTRACT regulatory fee, so allocating the day's
+    fee total pro-rata by contract quantity is the correct model, not a convenience approximation.
+    The total is exact; only the intraday *timing* of the drag is smoothed. Fees belonging to legs
+    still open at call time get spread over the completed trips, which makes the running net mildly
+    conservative -- the correct direction of error for a gate that is allowed to be wrong one way.
+
+    Returns copies; callers that need the fee-less figure must capture it before calling.
+    """
+    if not trips or not fees:
+        return trips
+    total_qty = sum((t.get("qty") or 0.0) for t in trips)
+    if total_qty <= 0:
+        return trips
+    out = []
+    for t in trips:
+        t2 = dict(t)
+        t2["fee"] = fees * (t.get("qty") or 0.0) / total_qty
+        t2["pnl"] = t["pnl"] - t2["fee"]
+        out.append(t2)
+    return out
 
 
 def _round_trips_full(fills: list):
@@ -3177,9 +3212,14 @@ async def daily_pnl_curve(date: Optional[str] = None, target: Optional[float] = 
                           full: bool = False) -> dict:
     """Reconstruct today's realized P&L trade-by-trade from your Robinhood option fills.
 
-    Builds the running cumulative-P&L curve (net of fees), marks the moment you crossed your daily
-    target, and quantifies what happened AFTER that point - the single number your logged history says
-    costs you money. `date` (YYYY-MM-DD ET) defaults to today; `full=True` returns every fill row.
+    Builds the running cumulative-P&L curve, marks the moment you crossed your daily target, and
+    quantifies what happened AFTER that point - the single number your logged history says costs
+    you money. `date` (YYYY-MM-DD ET) defaults to today; `full=True` returns every fill row.
+
+    B16: `realized$` and the curve are GROSS (fee-less), which is what the session store and
+    weekly_review have always persisted - restating them here would silently rewrite the logged
+    history. `fees$` and `realizedNet$` are reported alongside; `realizedNet$` is the figure that
+    reconciles to realized_pnl and to the should_i_trade gate. Use net for decisions.
     """
     d = date or _today_et().isoformat()
     tgt = float(target) if target is not None else _target()
@@ -3209,7 +3249,9 @@ async def daily_pnl_curve(date: Optional[str] = None, target: Optional[float] = 
     for tr in trips:
         by_chain[tr["chain"]] = round(by_chain.get(tr["chain"], 0.0) + tr["pnl"], 2)
     after = (round(cur["total"] - cur["crossCum"], 2) if cur["crossCum"] is not None else None)
+    _fees = float(fmeta.get("fees$") or 0.0)
     out = {"date": d, "target$": round(tgt, 2), "realized$": round(cur["total"], 2),
+           "fees$": round(_fees, 2), "realizedNet$": round(cur["total"] - _fees, 2),
            "orders": len(fills), "roundTrips": len(trips),
            "peak$": round(cur["peak"], 2), "maxDrawdownFromPeak$": round(cur["maxDrawdownFromPeak"], 2),
            "byUnderlying$": by_chain,
@@ -3323,6 +3365,7 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
     d = date or _today_et().isoformat()
     tgt = float(target) if target is not None else _target()
     giveback_frac = float(_cfg("giveback_frac"))
+    near_frac = float(_cfg("near_target_frac"))
     rapid_secs = float(_cfg("rapid_reentry_secs"))
     late_et = str(_cfg("late_session_et"))
     is_today = (d == _today_et().isoformat())
@@ -3347,6 +3390,13 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
                 "asof": _dt.datetime.now(ET).strftime("%H:%M:%S ET")}
     now = _dt.datetime.now(ET)
     trips, tstats = _round_trips_full(fills)
+    # B16: this gate now runs on NET P&L. daily_target and realized_pnl were already fee-inclusive;
+    # this one still read the fee-less round-trip sum, so it could fire PAST_TARGET on a day the
+    # account had NOT cleared target (2026-08-17: $556.68 gross vs $523.36 net vs a $524 target --
+    # the gate said STOP while the day was 64c short).
+    gross = round(sum(t["pnl"] for t in trips), 2)
+    fees = float(fmeta.get("fees$") or 0.0)
+    trips = _apply_fees(trips, fees)
     cur = _build_curve(trips, tgt)
     total = cur["total"]
     peak = cur["peak"]
@@ -3363,15 +3413,23 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
         import asyncio
         try:
             _recon = await asyncio.to_thread(_rh_realized_recon_sync, d)
-            _rr = _recon.get("roundTripRealized$")
+            # B16: compare like with like. Now that the gate total is net, checking it against
+            # recon's FEE-LESS roundTripRealized$ would disagree by exactly the day's fees on every
+            # single call and raise DATA_INCOMPLETE on a perfectly healthy tape.
+            _rr = _recon.get("feeInclusiveRealized$")
             if _rr is not None and abs(_rr - round(total, 2)) > 1.0:
                 data_incomplete = True
                 data_warnings.append(f"Reconstruction cross-check disagrees: gate ${total:.2f} vs "
-                                     f"recon ${_rr:.2f} - treating inputs as incomplete.")
+                                     f"recon ${_rr:.2f} (both net) - treating inputs as incomplete.")
         except Exception:  # noqa: BLE001
             pass
 
     past_target = total >= tgt and tgt > 0
+    # B16: moving gross -> net makes this gate fire LATER, i.e. strictly MORE permissive. The fee
+    # gap had been doing unearned protective work (~$4/round trip, so ~$67 on a 16-trip day -- and
+    # high-trip days are the documented losing profile). NEAR_TARGET restores that buffer on
+    # purpose rather than as an accounting accident.
+    near_target = (not past_target) and tgt > 0 and total >= near_frac * tgt
     giveback = peak >= tgt and (peak - total) >= giveback_frac * tgt
     last3 = trips[-3:]
     consec_losses = len(last3) >= 3 and all(t["pnl"] < 0 for t in last3)
@@ -3405,6 +3463,11 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
         flags.append("PAST_TARGET")
         reasons.append(f"You're at ${total:.2f} vs ${tgt:.0f} target. Post-target trades are your "
                        f"documented main source of losses.")
+    if near_target:
+        flags.append("NEAR_TARGET")
+        reasons.append(f"${total:.2f} net vs ${tgt:.0f} target ({total / tgt * 100:.0f}%) - inside "
+                       f"the last {(1 - near_frac) * 100:.0f}%. The remaining ${tgt - total:.2f} is "
+                       f"not worth a full-size entry. If you take one, take it small.")
     if giveback:
         flags.append("GIVING_BACK")
         reasons.append(f"You peaked at ${peak:.2f} and are now ${total:.2f} - given back "
@@ -3430,14 +3493,15 @@ async def should_i_trade(date: Optional[str] = None, target: Optional[float] = N
         verdict = "STOP"
     elif data_incomplete:
         verdict = "UNKNOWN"     # B2: partial fills -> cannot clear you to trade
-    elif late or rapid or deep_dd or consec2:
+    elif late or rapid or deep_dd or consec2 or near_target:
         verdict = "CAUTION"
     else:
         verdict = "GO"
     if not reasons:
         reasons.append("No discipline flags: within target, no tilt signals, normal pacing.")
     out = {"date": d, "verdict": verdict, "flags": flags, "reasons": reasons,
-           "realized$": round(total, 2), "peak$": round(peak, 2), "target$": round(tgt, 2),
+           "realized$": round(total, 2), "realizedGross$": gross, "fees$": round(fees, 2),
+           "peak$": round(peak, 2), "target$": round(tgt, 2),
            "roundTrips": len(trips), "asof": now.strftime("%H:%M:%S ET") if is_today else "EOD review"}
     if data_incomplete:
         out["dataWarnings"] = data_warnings
@@ -3975,6 +4039,7 @@ _CONFIG_DEFAULTS = {
     "daily_target": 524.0,        # $ profit target per trading day
     "weekly_target": None,        # optional $ weekly target (informational)
     "giveback_frac": 0.40,        # give-back from intraday peak (x target) -> STOP
+    "near_target_frac": 0.90,     # net P&L >= this x target -> NEAR_TARGET CAUTION (B16)
     "rapid_reentry_secs": 90.0,   # entries closer than this flag churning
     "late_session_et": "15:45",   # final-stretch CAUTION after this ET time
     "max_trades_per_day": None,   # optional round-trip cap (informational)
@@ -3984,6 +4049,7 @@ _CONFIG_DEFAULTS = {
 _CONFIG_ENV = {
     "daily_target": "DAILY_TARGET",
     "giveback_frac": "TE_GIVEBACK_FRAC",
+    "near_target_frac": "TE_NEAR_TARGET_FRAC",
     "rapid_reentry_secs": "TE_RAPID_REENTRY_SECS",
     "late_session_et": "TE_LATE_SESSION_ET",
 }
@@ -4061,7 +4127,7 @@ async def trading_config(action: str = "show", key: Optional[str] = None,
     `action='show'` (default) lists every setting, its effective value, and source (env / config /
     default). `action='set'` with `key` and `value` writes to config.json (e.g. key='daily_target',
     value='550'). `action='reset'` with `key` removes it. Env vars, if set, always win over the file.
-    Editable keys: daily_target, weekly_target, giveback_frac, rapid_reentry_secs, late_session_et,
+    Editable keys: daily_target, weekly_target, giveback_frac, near_target_frac, rapid_reentry_secs, late_session_et,
     max_trades_per_day, roll_delta, roll_dte.
     """
     import json
