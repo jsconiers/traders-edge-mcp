@@ -11,6 +11,10 @@ echo "== --selftest ==";              "$PY" "$F" --selftest
 echo "== freshness lint (#1) ==";     "$PY" test_freshness_lint.py "$F"
 echo "== sqlite persistence (#3) =="; "$PY" test_sqlite_persistence.py "$F"
 # Optional B1-B15 plumbing regression: only runs if that script is also present.
+if [ -f test_b17_parity_drift.py ]; then
+  echo "== B17 parity-drift gate =="; PYTHONPATH="$(pwd)" "$PY" test_b17_parity_drift.py
+fi
+
 if [ -f regress_b1_b15.py ]; then
   echo "== plumbing regression ==";   "$PY" regress_b1_b15.py
 else

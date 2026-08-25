@@ -348,6 +348,12 @@ def _nearest_expiry(options: list, root: str = "SPXW") -> Optional[str]:
 
 # ---- Robinhood SPXW chain: PRIMARY 0DTE feed (CBOE delayed = stale-flagged fallback) ----
 RH_CHAIN_TTL = 60.0
+
+# B17: max |parity spot - live index print| before the RH option MARKS are treated as stale,
+# as a fraction of spot. 0.0015 = 15bp (~11 SPX pts at 7,650) -- comfortably above genuine
+# put/call-parity noise from wide opening spreads, far below the 29pt gap observed on
+# 2026-08-25 (parity 7655.70 vs live SPX 7685.01) when RH served prior-session closing marks.
+PARITY_MAX_DRIFT = float(os.environ.get("TE_PARITY_MAX_DRIFT", "0.0015"))
 _rh_chain_id_cache = {"id": None, "ts": 0.0}
 
 
@@ -478,6 +484,73 @@ async def _rh_chain_cached(expiry: str) -> Optional[dict]:
     return ch
 
 
+async def _verify_parity_spot(ch: dict) -> dict:
+    """B17: cross-check the RH put/call-parity spot against an INDEPENDENT live index print.
+
+    The parity spot is derived from option MARKS. When RH serves prior-session marks during RTH,
+    the HTTP response is new, so `asof` ticks and every age-based freshness check passes -- while
+    the price is yesterday's. Age proves the RESPONSE is fresh; only an independent print proves
+    the MARKS are.
+
+    Observed 2026-08-25 09:34 ET: parity 7655.70 vs live SPX 7685.01 (29.3pt / 38bp gap). That put
+    spot BELOW the 7668 gamma flip when it was actually ABOVE it, flipping the reported regime from
+    long-gamma (pin / fade extremes) to "short gamma (trend / amplify)" -- an inverted 0DTE posture
+    served with freshness "live", stale=False.
+
+    On breach: swap `spot` to the live print (so flip-side, wall distance and GEX sign self-correct
+    for every downstream 0DTE tool) and mark freshness stale. The MARKS are NOT repaired -- anything
+    premium-derived (expected move, straddle, IV, greeks) is still the prior session and is flagged
+    as such via `premiumDerivedStale`.
+
+    No-op when no independent print is available: a missing reference must never silently "confirm"
+    the parity spot. That failure mode is recorded explicitly as parityCheck "unverified".
+    """
+    spot = ch.get("spot")
+    if not spot or not _market_open_et():
+        return ch
+    spx_live, src = await _live_spx_print()
+    ch = dict(ch)
+    fr = dict(ch.get("freshness") or {})
+    if not spx_live:
+        fr["parityCheck"] = "unverified"
+        fr["parityCheckNote"] = ("No independent live SPX print (Robinhood index AND E*TRADE both "
+                                 "unavailable) - parity spot could NOT be validated against marks. "
+                                 "Treat spot-relative levels as unconfirmed.")
+        ch["freshness"] = fr
+        return ch
+    drift = spx_live - spot
+    # Compare as a ratio with a small epsilon: (spot*k) and (spot - spot*k) do not round-trip
+    # exactly in float, so a drift sitting precisely on the threshold would flip verdicts on
+    # last-bit noise. The epsilon makes the boundary deterministic; it is ~7 orders of magnitude
+    # below any drift that could matter (1e-12 of spot is <1e-8 SPX pts).
+    fr["parityCheck"] = ("ok" if abs(drift) / spot <= PARITY_MAX_DRIFT + 1e-12
+                         else "STALE_MARKS")
+    fr["parityDriftPts"] = round(drift, 2)
+    fr["parityDriftPct"] = round(drift / spot * 100.0, 3)
+    fr["liveIndexPrint"] = round(spx_live, 2)
+    fr["liveIndexSource"] = src
+    if fr["parityCheck"] == "STALE_MARKS":
+        fr["paritySpot"] = round(spot, 2)          # keep the bad value visible, never hide it
+        fr["spotSource"] = f"{src} (live index print; parity marks stale)"
+        fr["stale"] = True
+        fr["verdict"] = "stale-marks"
+        fr["premiumDerivedStale"] = True
+        fr["warning"] = (
+            f"RH option marks are stale: parity spot {spot:.2f} vs live SPX {spx_live:.2f} "
+            f"({drift:+.2f} pts / {drift / spot * 100.0:+.3f}%), beyond the "
+            f"{PARITY_MAX_DRIFT * 100:.2f}% tolerance. `spot` has been REPLACED with the live "
+            f"print so flip-side / wall-distance / GEX sign are correct. Premium-derived values "
+            f"(expected move, straddle, IV, greeks) still come from the stale marks - do NOT "
+            f"trade sizing off them until the chain refreshes.")
+        ch["spot"] = spx_live
+        log.warning("B17 parity drift %.2f pts (%.3f%%): spot %.2f -> live %.2f (%s)",
+                    drift, drift / spot * 100.0, spot, spx_live, src)
+    else:
+        fr["spotSource"] = "robinhood_parity (validated vs live index print)"
+    ch["freshness"] = fr
+    return ch
+
+
 async def _maybe_merge_spx(rh_ch: dict, expiry: str, root: str) -> dict:
     """B10: the RH feed carries ONLY the SPXW book. For root='ALL' on a date where AM-settled SPX
     monthlies also trade (OpEx), merge the CBOE SPX rows for that expiry so GEX/walls don't
@@ -525,7 +598,9 @@ async def _load_chain_smart(zero_dte: bool = False, expiration: Optional[str] = 
             if target:
                 rh_ch = await _rh_chain_cached(target)
                 if rh_ch is not None:
-                    return await _maybe_merge_spx(rh_ch, target, root)
+                    # B17: validate parity spot against a live print BEFORE any tool reads it.
+                    return await _verify_parity_spot(
+                        await _maybe_merge_spx(rh_ch, target, root))
             if zero_dte and not expiration:
                 # Today really has no contracts (holiday / series rolled off) -- now, and only
                 # now, ask RH what the next real expiry is.
@@ -534,7 +609,8 @@ async def _load_chain_smart(zero_dte: bool = False, expiration: Optional[str] = 
                 if nxt:
                     rh_ch = await _rh_chain_cached(nxt)
                     if rh_ch is not None:
-                        return await _maybe_merge_spx(rh_ch, nxt, root)
+                        return await _verify_parity_spot(
+                            await _maybe_merge_spx(rh_ch, nxt, root))
         except Exception as exc:  # noqa: BLE001 -- any RH failure falls back to CBOE
             log.info("RH chain unavailable (%s); falling back to CBOE delayed", str(exc)[:140])
     ch = dict(await _load_chain())
@@ -5714,9 +5790,21 @@ async def feed_health() -> dict:
     try:
         rh_ch = await asyncio.wait_for(_rh_chain_cached(_today_et().isoformat()), timeout=12)
         if rh_ch and rh_ch.get("options"):
+            # B17: "up with contracts" is NOT "trustworthy". Validate the parity spot against an
+            # independent print before declaring OK -- on 2026-08-25 this probe reported OK on a
+            # chain whose spot was 29pts stale, and the composite inherited that green.
+            rh_ch = await _verify_parity_spot(rh_ch)
+            _pf = (rh_ch.get("freshness") or {})
+            _pchk = _pf.get("parityCheck")
             rh_probe = {"up": True, "contracts": len(rh_ch.get("options") or []),
-                        "paritySpot": round(rh_ch["spot"], 2) if rh_ch.get("spot") else None,
-                        "verdict": "OK"}
+                        "paritySpot": _pf.get("paritySpot"),
+                        "parityCheck": _pchk,
+                        "parityDriftPts": _pf.get("parityDriftPts"),
+                        "verdict": {"STALE_MARKS": "STALE_MARKS",
+                                    "unverified": "UNVERIFIED"}.get(_pchk, "OK")}
+            if _pchk == "STALE_MARKS":
+                rh_probe["liveIndexPrint"] = _pf.get("liveIndexPrint")
+                rh_probe["note"] = _pf.get("warning")
         elif not _is_trading_day(_today_et()):
             rh_probe = {"up": False, "verdict": "CLOSED",
                         "note": "Not a trading day; RH has no live 0DTE chain."}
