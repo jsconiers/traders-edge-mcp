@@ -354,6 +354,13 @@ RH_CHAIN_TTL = 60.0
 # put/call-parity noise from wide opening spreads, far below the 29pt gap observed on
 # 2026-08-25 (parity 7655.70 vs live SPX 7685.01) when RH served prior-session closing marks.
 PARITY_MAX_DRIFT = float(os.environ.get("TE_PARITY_MAX_DRIFT", "0.0015"))
+
+# B19: max divergence between SPY's day-over-day return and the parity spot's implied
+# day-over-day return before the marks are treated as stale. Wider than PARITY_MAX_DRIFT because
+# the SPY-implied reference carries its own tracking error + parity noise (~6bp typical, ~15bp on
+# a violent tape). 20bp catches any prior-session gap beyond ~15 SPX pts. Measured 2026-08-25:
+# healthy 0.8bp, stale-marks 35.9bp -- a ~45x separation, so the band is not delicate.
+SPY_DIVERGENCE_MAX = float(os.environ.get("TE_SPY_DIVERGENCE_MAX", "0.0020"))
 _rh_chain_id_cache = {"id": None, "ts": 0.0}
 
 
@@ -484,6 +491,76 @@ async def _rh_chain_cached(expiry: str) -> Optional[dict]:
     return ch
 
 
+def _spy_quote_sync() -> tuple:
+    """(last, prev_close) for SPY from Robinhood, or (None, None).
+
+    B19: `_spy_live_sync` returns only the last price. The day-over-day check needs the prior
+    close too, and RH's equity quote carries both in one call. This transport WORKS -- unlike the
+    retired index route B18 negative-caches (verified 2026-08-25: index quotes AND index
+    historicals both 404 under robin_stocks, while equity quotes return normally).
+    """
+    import robin_stocks.robinhood as rh
+    _rh_login_sync()
+    try:
+        q = (rh.stocks.get_quotes("SPY") or [None])[0] or {}
+    except Exception:  # noqa: BLE001
+        return None, None
+    last = _to_float(q.get("last_trade_price"))
+    prev = _to_float(q.get("adjusted_previous_close") or q.get("previous_close"))
+    return (last or None), (prev or None)
+
+
+async def _cboe_spx_prev_close() -> Optional[float]:
+    """SPX prior-session close from CBOE's public quote CDN, cached for the session date.
+
+    B19: deliberately NOT a broker source. This is the piece that lets the day-over-day check
+    survive an E*TRADE OAuth expiry -- CBOE's delayed_quotes CDN needs no auth at all. The level
+    it carries is ~15-min delayed, but `prev_day_close` is a settled figure, so the delay is
+    irrelevant for this use.
+    """
+    key = f"spxprev:{_today_et().isoformat()}"
+    hit = _cache.get(key)
+    if hit:
+        return hit[0]
+    try:
+        d = await _get_json(CBOE_QUOTE_URL.format(sym=SPX_FILE_ROOT), 1800.0)
+    except Exception:  # noqa: BLE001
+        return None
+    v = _to_float(((d or {}).get("data") or {}).get("prev_day_close"))
+    if not v:
+        return None
+    _cache.put(key, (v, time.monotonic()))
+    return v
+
+
+async def _spy_implied_spx() -> tuple:
+    """B19 tier 2: a broker-INDEPENDENT SPX reference built from SPY's day-over-day return.
+
+    implied_SPX = SPX_prev_close * (SPY_live / SPY_prev_close)
+
+    Deliberately return-based rather than level-based. Converting SPY->SPX by level needs the
+    ~18pt dividend basis, which is LARGER than PARITY_MAX_DRIFT -- so a level check would either
+    false-positive constantly or need a cached basis, reintroducing exactly the circularity the
+    2026-07-15 `_auto_basis` incident was about. In return space the basis sits in both prior
+    closes and cancels out entirely; nothing needs calibrating.
+
+    Accuracy measured 2026-08-25 11:03 ET: implied 7664.39 vs actual 7665.70 (1.3 pts), which is
+    well inside the tolerance and good enough to serve as a substitute spot, not merely a
+    detector. Returns (implied_spx, detail) or (None, detail-with-reason).
+    """
+    import asyncio
+    (spy, spy_prev), spx_prev = await asyncio.gather(
+        asyncio.to_thread(_spy_quote_sync), _cboe_spx_prev_close())
+    missing = [n for n, v in (("spyLive", spy), ("spyPrevClose", spy_prev),
+                              ("spxPrevClose", spx_prev)) if not v]
+    if missing:
+        return None, {"reason": f"unavailable: {', '.join(missing)}"}
+    spy_ret = spy / spy_prev
+    return round(spx_prev * spy_ret, 2), {
+        "spyLive": spy, "spyPrevClose": spy_prev, "spxPrevClose": spx_prev,
+        "spyReturnPct": round((spy_ret - 1.0) * 100.0, 3)}
+
+
 async def _verify_parity_spot(ch: dict) -> dict:
     """B17: cross-check the RH put/call-parity spot against an INDEPENDENT live index print.
 
@@ -508,45 +585,73 @@ async def _verify_parity_spot(ch: dict) -> dict:
     spot = ch.get("spot")
     if not spot or not _market_open_et():
         return ch
-    spx_live, src = await _live_spx_print()
+    import asyncio
     ch = dict(ch)
     fr = dict(ch.get("freshness") or {})
-    if not spx_live:
+    (spx_live, src), (spy_spx, spy_det) = await asyncio.gather(
+        _live_spx_print(), _spy_implied_spx())
+
+    # B19 cross-check: when BOTH references exist, disagreement between them means one of the two
+    # is itself wrong. Record it rather than trusting the broker print blindly -- tier 1 being
+    # authoritative is not the same as tier 1 being infallible.
+    if spx_live and spy_spx and abs(spx_live - spy_spx) / spot > SPY_DIVERGENCE_MAX:
+        fr["refDisagreementPts"] = round(spx_live - spy_spx, 2)
+        fr["refDisagreement"] = (
+            f"Independent references disagree: broker print {spx_live:.2f} vs SPY-implied "
+            f"{spy_spx:.2f}. One of them is wrong -- treat spot-relative levels with caution.")
+        log.warning("B19 reference disagreement: broker %.2f vs spy-implied %.2f", spx_live, spy_spx)
+
+    # Tier 1 = an absolute broker print (tightest). Tier 2 = SPY day-over-day, which needs no
+    # broker session at all, so an expired OAuth degrades the check instead of disabling it.
+    if spx_live:
+        ref, ref_src, tol = spx_live, src, PARITY_MAX_DRIFT
+        fr["refTier"] = "broker_print"
+        fr["liveIndexPrint"] = round(spx_live, 2)
+        fr["liveIndexSource"] = src
+        if spy_spx:
+            fr["spyImpliedSpx"] = spy_spx
+    elif spy_spx:
+        ref, ref_src, tol = spy_spx, "spy_implied_dod", SPY_DIVERGENCE_MAX
+        fr["refTier"] = "spy_dod"
+        fr["spyImpliedSpx"] = spy_spx
+        fr["spyDetail"] = spy_det
+        fr["refTierNote"] = ("No broker SPX print - validated against SPY day-over-day return "
+                             "(broker-independent). Wider tolerance than a direct print.")
+    else:
         fr["parityCheck"] = "unverified"
-        fr["parityCheckNote"] = ("No independent live SPX print (Robinhood index AND E*TRADE both "
-                                 "unavailable) - parity spot could NOT be validated against marks. "
-                                 "Treat spot-relative levels as unconfirmed.")
+        fr["parityCheckNote"] = (
+            "No independent reference: broker SPX print unavailable AND the SPY day-over-day "
+            f"fallback could not be built ({spy_det.get('reason', 'unknown')}). Parity spot could "
+            "NOT be validated against marks - treat spot-relative levels as unconfirmed.")
         ch["freshness"] = fr
         return ch
-    drift = spx_live - spot
+    drift = ref - spot
     # Compare as a ratio with a small epsilon: (spot*k) and (spot - spot*k) do not round-trip
     # exactly in float, so a drift sitting precisely on the threshold would flip verdicts on
     # last-bit noise. The epsilon makes the boundary deterministic; it is ~7 orders of magnitude
     # below any drift that could matter (1e-12 of spot is <1e-8 SPX pts).
-    fr["parityCheck"] = ("ok" if abs(drift) / spot <= PARITY_MAX_DRIFT + 1e-12
+    fr["parityCheck"] = ("ok" if abs(drift) / spot <= tol + 1e-12
                          else "STALE_MARKS")
     fr["parityDriftPts"] = round(drift, 2)
     fr["parityDriftPct"] = round(drift / spot * 100.0, 3)
-    fr["liveIndexPrint"] = round(spx_live, 2)
-    fr["liveIndexSource"] = src
     if fr["parityCheck"] == "STALE_MARKS":
         fr["paritySpot"] = round(spot, 2)          # keep the bad value visible, never hide it
-        fr["spotSource"] = f"{src} (live index print; parity marks stale)"
+        fr["spotSource"] = f"{ref_src} (independent reference; parity marks stale)"
         fr["stale"] = True
         fr["verdict"] = "stale-marks"
         fr["premiumDerivedStale"] = True
         fr["warning"] = (
-            f"RH option marks are stale: parity spot {spot:.2f} vs live SPX {spx_live:.2f} "
-            f"({drift:+.2f} pts / {drift / spot * 100.0:+.3f}%), beyond the "
-            f"{PARITY_MAX_DRIFT * 100:.2f}% tolerance. `spot` has been REPLACED with the live "
-            f"print so flip-side / wall-distance / GEX sign are correct. Premium-derived values "
+            f"RH option marks are stale: parity spot {spot:.2f} vs {ref_src} reference "
+            f"{ref:.2f} ({drift:+.2f} pts / {drift / spot * 100.0:+.3f}%), beyond the "
+            f"{tol * 100:.2f}% tolerance. `spot` has been REPLACED with the reference "
+            f"so flip-side / wall-distance / GEX sign are correct. Premium-derived values "
             f"(expected move, straddle, IV, greeks) still come from the stale marks - do NOT "
             f"trade sizing off them until the chain refreshes.")
-        ch["spot"] = spx_live
-        log.warning("B17 parity drift %.2f pts (%.3f%%): spot %.2f -> live %.2f (%s)",
-                    drift, drift / spot * 100.0, spot, spx_live, src)
+        ch["spot"] = ref
+        log.warning("B17 parity drift %.2f pts (%.3f%%): spot %.2f -> %.2f (%s, tier=%s)",
+                    drift, drift / spot * 100.0, spot, ref, ref_src, fr.get("refTier"))
     else:
-        fr["spotSource"] = "robinhood_parity (validated vs live index print)"
+        fr["spotSource"] = f"robinhood_parity (validated vs {ref_src})"
     ch["freshness"] = fr
     return ch
 

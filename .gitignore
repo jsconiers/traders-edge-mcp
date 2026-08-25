@@ -7,3 +7,4 @@ __pycache__/
 *.log
 config.json
 traders_edge.db
+*.bak-*
