@@ -6108,6 +6108,14 @@ _RH_INDEX_URL_CANDIDATES = [
     "https://api.robinhood.com/marketdata/quotes/{id}/",
 ]
 _rh_index_url_cache = {"url": None}
+# B18: negative cache. The success path pins the working template, but a TOTAL failure was never
+# remembered, so every call re-tried all candidates. Verified 2026-08-25: all 12 plausible URL
+# shapes 404 (RH appears to have retired the legacy api.robinhood.com index-quote route that
+# robin_stocks reaches; their own agent MCP serves indices from a different service). With B17
+# calling _live_spx_print() on EVERY _load_chain_smart(), that was 3 guaranteed-404 round-trips
+# per 0DTE tool call. Remember the failure for a few minutes and fall straight through to E*TRADE.
+_rh_index_fail_cache = {"until": 0.0}
+RH_INDEX_FAIL_TTL = 300.0
 
 
 def _rh_index_quote_sync(symbols: str) -> dict:
@@ -6117,6 +6125,12 @@ def _rh_index_quote_sync(symbols: str) -> dict:
     the first working URL template is discovered once and cached; set RH_INDEX_QUOTE_URL to pin it.
     """
     from robin_stocks.robinhood.helper import request_get
+    import time as _t
+    env_url = os.environ.get("RH_INDEX_QUOTE_URL", "").strip()
+    # B18: skip the whole probe while a recent total failure is still cached. An explicit
+    # RH_INDEX_QUOTE_URL pin always bypasses the negative cache so a fix takes effect at once.
+    if not env_url and _t.time() < _rh_index_fail_cache["until"]:
+        return {}
     _rh_login_sync()
     syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     id_for = {s: _RH_INDEX_IDS.get(s) for s in syms}
@@ -6124,7 +6138,6 @@ def _rh_index_quote_sync(symbols: str) -> dict:
     if not ids:
         return {}
     ids_join = ",".join(ids)
-    env_url = os.environ.get("RH_INDEX_QUOTE_URL", "").strip()
     candidates = [env_url] if env_url else []
     if _rh_index_url_cache["url"]:
         candidates.append(_rh_index_url_cache["url"])
@@ -6151,7 +6164,13 @@ def _rh_index_quote_sync(symbols: str) -> dict:
             _rh_index_url_cache["url"] = tmpl
             break
     if not payload:
+        # B18: every candidate failed -- remember it so the next 0DTE tool call doesn't re-probe.
+        _rh_index_fail_cache["until"] = _t.time() + RH_INDEX_FAIL_TTL
+        log.info("RH index endpoint: all %d candidates failed; suppressing retries for %.0fs "
+                 "(falling through to E*TRADE). Pin RH_INDEX_QUOTE_URL to restore.",
+                 len([c for c in candidates if c]), RH_INDEX_FAIL_TTL)
         return {}
+    _rh_index_fail_cache["until"] = 0.0     # recovered - clear the suppression immediately
     by_id = {}
     for row in payload:
         by_id[row.get("instrument_id") or row.get("id")] = row
