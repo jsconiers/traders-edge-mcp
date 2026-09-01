@@ -4996,12 +4996,24 @@ async def morning_brief() -> dict:
 
 
 @mcp.tool()
-async def eod_wrap() -> dict:
-    """End-of-day wrap: today realized vs target, discipline adherence (stopped at target vs gave back),
+async def eod_wrap(date: Optional[str] = None) -> dict:
+    """End-of-day wrap: realized vs target, discipline adherence (stopped at target vs gave back),
     where the key 0DTE levels closed, and a snapshot logged to SQLite history. Run after the close to
-    score the day and capture closing state.
+    score the day and capture closing state. `date` (YYYY-MM-DD ET) defaults to today.
+
+    B20: `date` exists because this tool used to hardcode _today_et() while daily_pnl_curve /
+    daily_review / tilt_detector all accepted one. Run at 06:38 on 2026-09-01 it wrapped the
+    not-yet-opened Sep 1 session instead of Monday's, reported "no completed round trips", and
+    persisted a NULL/NULL row for a date that had not happened.
     """
     import asyncio
+    d = date or _today_et().isoformat()
+    try:
+        d_obj = _dt.date.fromisoformat(d)
+    except ValueError:
+        raise EdgeError(f"eod_wrap: date must be YYYY-MM-DD, got {d!r}")
+    if d_obj > _today_et():
+        raise EdgeError(f"eod_wrap: {d} is in the future (today is {_today_et().isoformat()} ET).")
     # daily_review / should_i_trade / snapshot_log each `import robin_stocks` inside their own
     # to_thread worker. On a COLD process three simultaneous first-imports trip CPython's
     # module-lock deadlock detector (_DeadlockError) -- and eod_wrap is a plausible first call
@@ -5010,10 +5022,10 @@ async def eod_wrap() -> dict:
         await asyncio.to_thread(__import__, "robin_stocks.robinhood")
     except Exception:  # noqa: BLE001 -- if it's genuinely missing, surfaces downstream as EdgeError
         pass
-    dr, sit, snap = await asyncio.gather(daily_review(), should_i_trade(), snapshot_log(),
+    dr, sit, snap = await asyncio.gather(daily_review(date=d), should_i_trade(), snapshot_log(),
                                          return_exceptions=True)
     dr, sit, snap = _safe_dict(dr), _safe_dict(sit), _safe_dict(snap)
-    out = {"date": _today_et().isoformat()}
+    out = {"date": d}
     # daily_review emits realized$ / roundTrips and nests the target split under
     # beforeVsAfterTarget. Read THOSE names: pnl$ / trades / targetHitAt are a stale
     # daily_review schema, so "pnl$" was never present -- every session fell through to
@@ -5047,27 +5059,42 @@ async def eod_wrap() -> dict:
     out["discipline"] = {"verdict": sit.get("verdict"), "notes": notes}
     if isinstance(snap, dict) and snap.get("logged"):
         s = snap.get("snapshot") or {}
+        # B20: only call it a "session close" if the session is actually over. Run pre-market this
+        # block labelled a live/stale intraday snapshot as closing levels for a day that had not traded.
+        _done = (d_obj < _today_et()) or (_dt.datetime.now(ET).time() >= _session_close_et(d_obj))
         out["closingLevels"] = {"spot": s.get("spot"), "gammaFlip": s.get("gamma_flip"),
                                 "callWall": s.get("call_wall"), "putWall": s.get("put_wall"),
                                 "vix": s.get("vix"), "regime": s.get("regime"),
-                                "source": "closing snapshot",                     # (#1)
-                                "freshness": {"asof": out["date"], "note": "session close"}}
+                                "source": "closing snapshot" if _done else "INTRADAY snapshot",
+                                "freshness": {"asof": out["date"],
+                                              "note": "session close" if _done else
+                                                      "session NOT closed - levels are not final"}}
         out["snapshotLogged"] = True
     else:
         out["snapshotLogged"] = False
     # (#3) Persist the session scorecard + today's fills so weekly_review / discipline_backtest can
     # read history from disk instead of re-paging RH (and it survives RH endpoint drift). Today is
     # NOT marked "complete" here -- it gets ingested as a past day on the next window pull.
-    try:
-        import asyncio
-        await asyncio.to_thread(_session_upsert_sync, {
-            "date": out["date"], "realized": realized, "fee_inclusive": None, "fees": None,
-            "trips": dr.get("roundTrips"), "cross_time": hit_at, "verdict": sit.get("verdict"),
-            "updated": _dt.datetime.now(ET).isoformat()})
-        _by, _m = await _fills_window(_today_et(), _today_et())
-        out["persisted"] = {"session": True, "fillDays": len(_by), "source": _m.get("source")}
-    except Exception as _exc:  # noqa: BLE001
-        out["persisted"] = {"error": str(_exc)[:120]}
+    #
+    # B20: only persist a session that ACTUALLY HAS FILLS. This upsert used to be unconditional, so
+    # any run on a day with no round trips wrote a realized=NULL / trips=NULL row -- and weekly_review
+    # and discipline_backtest read this table, so a pre-market run silently injected a phantom flat
+    # day into the record. An empty day is the absence of a session, not a session worth zero.
+    if realized is None:
+        out["persisted"] = {"session": False,
+                            "reason": f"no completed round trips on {d} - nothing to persist "
+                                      f"(refusing to write a NULL session row)"}
+    else:
+        try:
+            import asyncio
+            await asyncio.to_thread(_session_upsert_sync, {
+                "date": d, "realized": realized, "fee_inclusive": None, "fees": None,
+                "trips": dr.get("roundTrips"), "cross_time": hit_at, "verdict": sit.get("verdict"),
+                "updated": _dt.datetime.now(ET).isoformat()})
+            _by, _m = await _fills_window(d_obj, d_obj)
+            out["persisted"] = {"session": True, "fillDays": len(_by), "source": _m.get("source")}
+        except Exception as _exc:  # noqa: BLE001
+            out["persisted"] = {"error": str(_exc)[:120]}
     return out
 
 
