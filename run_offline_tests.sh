@@ -15,6 +15,10 @@ if [ -f test_b20_eod_date.py ] && [ -n "$TE_LIVE" ]; then
   echo "== B20 eod_wrap date =="; PYTHONPATH="$(pwd)" "$PY" test_b20_eod_date.py
 fi
 
+if [ -f test_b21_b22.py ]; then
+  echo "== B21/B22 spot+auth gate =="; PYTHONPATH="$(pwd)" "$PY" test_b21_b22.py
+fi
+
 if [ -f test_b17_b19_parity.py ]; then
   echo "== B17/B19 parity gate =="; PYTHONPATH="$(pwd)" "$PY" test_b17_b19_parity.py
 fi

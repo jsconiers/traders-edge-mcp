@@ -361,6 +361,14 @@ PARITY_MAX_DRIFT = float(os.environ.get("TE_PARITY_MAX_DRIFT", "0.0015"))
 # a violent tape). 20bp catches any prior-session gap beyond ~15 SPX pts. Measured 2026-08-25:
 # healthy 0.8bp, stale-marks 35.9bp -- a ~45x separation, so the band is not delicate.
 SPY_DIVERGENCE_MAX = float(os.environ.get("TE_SPY_DIVERGENCE_MAX", "0.0020"))
+
+# B21: tolerance for a CBOE chain spot, which is KNOWINGLY ~15 min old. Much tighter than
+# PARITY_MAX_DRIFT because the two measure different things: parity drift is noise (wide spreads)
+# and should not trip, whereas CBOE drift is simply the market moving while the chain sat still --
+# always real, and always worth superseding when a live print exists. 5bp (~3.8 SPX pts) catches
+# the 2026-09-01 case (10.72 pts = 14bp, which slipped UNDER the 15bp parity bar) without firing
+# on trivial 1-2pt lag.
+CBOE_SPOT_MAX_DRIFT = float(os.environ.get("TE_CBOE_SPOT_MAX_DRIFT", "0.0005"))
 _rh_chain_id_cache = {"id": None, "ts": 0.0}
 
 
@@ -626,6 +634,9 @@ async def _verify_parity_spot(ch: dict) -> dict:
         ch["freshness"] = fr
         return ch
     drift = ref - spot
+    # B21: a knowingly-delayed CBOE chain gets the tighter bar (see CBOE_SPOT_MAX_DRIFT).
+    if ch.get("source") == "cboe_delayed":
+        tol = min(tol, CBOE_SPOT_MAX_DRIFT)
     # Compare as a ratio with a small epsilon: (spot*k) and (spot - spot*k) do not round-trip
     # exactly in float, so a drift sitting precisely on the threshold would flip verdicts on
     # last-bit noise. The epsilon makes the boundary deterministic; it is ~7 orders of magnitude
@@ -635,23 +646,29 @@ async def _verify_parity_spot(ch: dict) -> dict:
     fr["parityDriftPts"] = round(drift, 2)
     fr["parityDriftPct"] = round(drift / spot * 100.0, 3)
     if fr["parityCheck"] == "STALE_MARKS":
+        _cboe = (ch.get("source") == "cboe_delayed")
+        _what = "CBOE delayed chain" if _cboe else "RH option marks"
+        if _cboe:
+            fr["parityCheck"] = "DELAYED_CHAIN_CORRECTED"   # expected for CBOE, not a defect
         fr["paritySpot"] = round(spot, 2)          # keep the bad value visible, never hide it
-        fr["spotSource"] = f"{ref_src} (independent reference; parity marks stale)"
+        fr["spotSource"] = f"{ref_src} (independent reference; chain spot superseded)"
         fr["stale"] = True
-        fr["verdict"] = "stale-marks"
+        fr["verdict"] = "delayed-chain-spot" if _cboe else "stale-marks"
         fr["premiumDerivedStale"] = True
         fr["warning"] = (
-            f"RH option marks are stale: parity spot {spot:.2f} vs {ref_src} reference "
+            f"{_what} spot {spot:.2f} vs {ref_src} reference "
             f"{ref:.2f} ({drift:+.2f} pts / {drift / spot * 100.0:+.3f}%), beyond the "
             f"{tol * 100:.2f}% tolerance. `spot` has been REPLACED with the reference "
             f"so flip-side / wall-distance / GEX sign are correct. Premium-derived values "
-            f"(expected move, straddle, IV, greeks) still come from the stale marks - do NOT "
-            f"trade sizing off them until the chain refreshes.")
+            f"(expected move, straddle, IV, greeks) still come from the delayed chain - do NOT "
+            f"trade sizing off them.")
         ch["spot"] = ref
-        log.warning("B17 parity drift %.2f pts (%.3f%%): spot %.2f -> %.2f (%s, tier=%s)",
-                    drift, drift / spot * 100.0, spot, ref, ref_src, fr.get("refTier"))
+        log.warning("B17/B21 spot drift %.2f pts (%.3f%%): %.2f -> %.2f (%s, src=%s, tier=%s)",
+                    drift, drift / spot * 100.0, spot, ref, ref_src,
+                    ch.get("source"), fr.get("refTier"))
     else:
-        fr["spotSource"] = f"robinhood_parity (validated vs {ref_src})"
+        _src = "cboe_delayed" if ch.get("source") == "cboe_delayed" else "robinhood_parity"
+        fr["spotSource"] = f"{_src} (validated vs {ref_src})"
     ch["freshness"] = fr
     return ch
 
@@ -717,11 +734,24 @@ async def _load_chain_smart(zero_dte: bool = False, expiration: Optional[str] = 
                         return await _verify_parity_spot(
                             await _maybe_merge_spx(rh_ch, nxt, root))
         except Exception as exc:  # noqa: BLE001 -- any RH failure falls back to CBOE
-            log.info("RH chain unavailable (%s); falling back to CBOE delayed", str(exc)[:140])
+            if _rh_auth_failed(exc):
+                # B22: drop the latched login so the NEXT call retries auth instead of failing
+                # forever, and log the real cause rather than the null-deref it surfaced as.
+                global _rh_logged_in
+                _rh_logged_in = False
+                log.warning("RH chain: SESSION EXPIRED (%s) -- %s", str(exc)[:80], RH_REAUTH_HINT)
+            else:
+                log.info("RH chain unavailable (%s); falling back to CBOE delayed", str(exc)[:140])
     ch = dict(await _load_chain())
     ch["source"] = "cboe_delayed"
     ch["freshness"] = _staleness(ch.get("asof"))
-    return ch
+    # B21: validate the CBOE spot too. _staleness() judges freshness by the chain's OWN age, so a
+    # chain inside its normal ~15-min delay reports verdict "fresh", stale=False -- while carrying a
+    # spot that is, by construction, up to 15 minutes old. On 2026-09-01 12:30 that spot read 7653.48
+    # against a live print of 7642.76: a 10.7pt gap that placed spot ABOVE the 7650 put wall when it
+    # had actually broken BELOW it. "Within normal latency" is not "current", and when RH errors this
+    # is the ONLY path left -- so the gate has to cover it, not just the RH parity path.
+    return await _verify_parity_spot(ch)
 
 
 def _feed_warnings(meta: dict) -> list:
@@ -2139,6 +2169,27 @@ _rh_cache = {"ts": 0.0, "data": None}
 def _occ_symbol(root: str, expiry: str, cp: str, strike) -> str:
     yy, mm, dd = expiry[2:4], expiry[5:7], expiry[8:10]
     return f"{root}{yy}{mm}{dd}{cp}{int(round(float(strike) * 1000)):08d}"
+
+
+RH_REAUTH_HINT = (
+    "Robinhood session expired or unauthorized. Re-auth in Terminal: "
+    "rm -f ~/.robinhood/robinhood.pickle && python3 -c "
+    "\"import robin_stocks.robinhood as r; r.login()\"  then restart Claude Desktop.")
+
+
+def _rh_auth_failed(exc: BaseException) -> bool:
+    """B22: does this exception smell like a dead Robinhood session?
+
+    A stale pickle makes request_get() return None on 401. Callers then do `.get()` on that None,
+    so the FIRST symptom the user sees is "'NoneType' object has no attribute 'get'" from whichever
+    helper happened to touch it -- a null-dereference standing in for "log in again". Observed
+    2026-09-01: one expired pickle took down the chain, the SPY overlay, tier 2 of the parity gate
+    and all P&L, and every surface reported a different unrelated-looking failure.
+    """
+    s = str(exc).lower()
+    return ("401" in s or "unauthorized" in s
+            or "nonetype' object has no attribute" in s
+            or "login" in s and "expired" in s)
 
 
 def _rh_login_sync() -> None:
@@ -5946,7 +5997,14 @@ async def feed_health() -> dict:
     except asyncio.TimeoutError:
         rh_probe = {"up": False, "verdict": "TIMEOUT", "note": "RH chain probe timed out (>12s)."}
     except Exception as exc:  # noqa: BLE001
-        rh_probe = {"up": False, "verdict": "ERROR", "error": str(exc)[:160]}
+        if _rh_auth_failed(exc):
+            # B22: a dead session is one cause with many symptoms -- name it once, here.
+            rh_probe = {"up": False, "verdict": "SESSION_EXPIRED",
+                        "error": str(exc)[:160], "action": RH_REAUTH_HINT,
+                        "note": "Chain, SPY overlay, parity-gate tier 2 and P&L all depend on "
+                                "this session - expect them to fail together until re-auth."}
+        else:
+            rh_probe = {"up": False, "verdict": "ERROR", "error": str(exc)[:160]}
     out["rhChain"] = rh_probe
 
     spy = None
