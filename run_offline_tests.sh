@@ -15,6 +15,10 @@ if [ -f test_b20_eod_date.py ] && [ -n "$TE_LIVE" ]; then
   echo "== B20 eod_wrap date =="; PYTHONPATH="$(pwd)" "$PY" test_b20_eod_date.py
 fi
 
+if [ -f test_b23_prevclose.py ]; then
+  echo "== B23 CBOE prev-close =="; PYTHONPATH="$(pwd)" "$PY" test_b23_prevclose.py
+fi
+
 if [ -f test_b21_b22.py ]; then
   echo "== B21/B22 spot+auth gate =="; PYTHONPATH="$(pwd)" "$PY" test_b21_b22.py
 fi

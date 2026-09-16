@@ -522,9 +522,23 @@ async def _cboe_spx_prev_close() -> Optional[float]:
     """SPX prior-session close from CBOE's public quote CDN, cached for the session date.
 
     B19: deliberately NOT a broker source. This is the piece that lets the day-over-day check
-    survive an E*TRADE OAuth expiry -- CBOE's delayed_quotes CDN needs no auth at all. The level
-    it carries is ~15-min delayed, but `prev_day_close` is a settled figure, so the delay is
-    irrelevant for this use.
+    survive an E*TRADE OAuth expiry -- CBOE's delayed_quotes CDN needs no auth at all.
+
+    B23: `prev_day_close` is only the PRIOR session's close when the snapshot is from the CURRENT
+    session. CBOE does not roll this CDN until well into the morning, so before the roll the
+    snapshot still describes yesterday -- and its `prev_day_close` therefore points at the day
+    BEFORE yesterday. Off by one session.
+
+    Observed 2026-09-16 09:36 ET (Fed day): snapshot stamped 2026-09-15T16:14:59 carried
+    prev_day_close=7619.98 (Monday) while `close`=7585.73 was Tuesday's actual close. Tier 2 built
+    on the Monday figure returned spot 7639.70 against a broker print of 7603.60 -- a 36pt error
+    that put spot ABOVE the 7615.82 gamma flip when it was BELOW it, inverting the regime read on
+    FOMC day. Caught only because B19's refDisagreement cross-check fired.
+
+    The fix reads the snapshot's own date. When the snapshot predates today, the session it
+    describes IS the prior session, so its `close` is exactly the figure we want and
+    `prev_day_close` must be ignored. Returns None rather than guess when the date is unreadable --
+    a silently off-by-one prior close is worse than no tier 2 at all.
     """
     key = f"spxprev:{_today_et().isoformat()}"
     hit = _cache.get(key)
@@ -534,7 +548,19 @@ async def _cboe_spx_prev_close() -> Optional[float]:
         d = await _get_json(CBOE_QUOTE_URL.format(sym=SPX_FILE_ROOT), 1800.0)
     except Exception:  # noqa: BLE001
         return None
-    v = _to_float(((d or {}).get("data") or {}).get("prev_day_close"))
+    blk = ((d or {}).get("data") or {})
+    stamp = blk.get("last_trade_time") or (d or {}).get("timestamp") or ""
+    try:
+        snap_date = _dt.date.fromisoformat(str(stamp)[:10])
+    except ValueError:
+        log.warning("B23: unreadable CBOE snapshot date %r - refusing to guess prev close", stamp)
+        return None
+    if snap_date >= _today_et():
+        v = _to_float(blk.get("prev_day_close"))          # snapshot is today: field is correct
+    else:
+        v = _to_float(blk.get("close") or blk.get("current_price"))   # snapshot IS the prior session
+        log.info("B23: CBOE snapshot dated %s (pre-roll); using its close %s as prior close, "
+                 "not prev_day_close %s", snap_date, v, blk.get("prev_day_close"))
     if not v:
         return None
     _cache.put(key, (v, time.monotonic()))
