@@ -1591,7 +1591,16 @@ async def next_event(importance: str = "high") -> dict:
 # ======================================================================
 
 FREDGRAPH = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-FRED_UA = "Mozilla/5.0"  # FRED's CDN tarpits long browser UAs; a simple one passes
+# B24: identify honestly instead of impersonating a browser. The previous value "Mozilla/5.0" was
+# chosen because FRED's CDN tarpitted long browser UAs -- but a BARE browser string with no platform
+# or engine is exactly what a spoofed bot looks like, and FRED tightened its heuristics until that
+# workaround became the trigger. Measured 2026-09-21: "Mozilla/5.0" -> ReadTimeout at 15s and 30s
+# (the CDN holds the socket and never answers); this UA, the httpx default, and curl -> HTTP 200 in
+# 0.1-0.3s on all four regime series. An honest tool UA is the durable choice: bot mitigation
+# targets impersonation, not self-identification. Env-overridable so the next CDN change is a
+# config edit, not a code change.
+FRED_UA = os.environ.get(
+    "TE_FRED_UA", "traders-edge-mcp/1.0 (+https://github.com/jsconiers/traders-edge-mcp)")
 FRED_API = "https://api.stlouisfed.org/fred"
 FRED_CACHE_TTL = 1800.0          # 30 min; macro series update slowly
 FRED_TIMEOUT = 30.0
@@ -5020,6 +5029,13 @@ async def _recent_session_summary():
             "winRate%": round(100 * wins / len(trips), 1)}
 
 
+# B24: per-dependency budget for morning_brief. Healthy dependencies return in 0.3-3.4s (measured
+# 2026-09-21), and they run concurrently, so the whole brief is bounded by roughly one budget for the
+# gather plus one for the trailing session summary -- ~40s worst case, far inside the 4-minute MCP
+# limit that the unbounded version kept blowing through.
+MORNING_BRIEF_DEP_TIMEOUT = float(os.environ.get("TE_MORNING_BRIEF_DEP_TIMEOUT", "20"))
+
+
 @mcp.tool()
 async def morning_brief() -> dict:
     """Pre-open command center: regime + posture, today's key 0DTE levels (spot, expected move, gamma
@@ -5027,10 +5043,22 @@ async def morning_brief() -> dict:
     earnings within ~7 days, your last session result, and the discipline reset. One call, not five.
     """
     import asyncio
-    z, rg, vx, ec, ear = await asyncio.gather(
-        zero_dte_exposure(), regime_classifier(), vix_complex(), economic_calendar(),
-        earnings_calendar(days=10), return_exceptions=True)
-    z, rg, vx, ec, ear = (_safe_dict(z), _safe_dict(rg), _safe_dict(vx), _safe_dict(ec), _safe_dict(ear))
+    # B24: bound EVERY dependency. gather(return_exceptions=True) survives ERRORS but not HANGS -- it
+    # waits for all five, so one stalled sub-call stalled the entire brief past the 4-minute MCP limit.
+    # That produced "No result received" / "Tool execution failed" on 2026-09-08, 09-18 (twice) and
+    # 09-21. The proximate cause was regime_classifier's FRED fetches being tarpitted (see FRED_UA),
+    # but the defect is structural: ANY slow input could do this. Each dependency now gets its own
+    # budget; a slow one degrades to an empty section and is NAMED in `degraded`, instead of taking
+    # the gamma map, the vol complex and the calendar down with it.
+    names = ("zero_dte_exposure", "regime_classifier", "vix_complex",
+             "economic_calendar", "earnings_calendar")
+    coros = (zero_dte_exposure(), regime_classifier(), vix_complex(),
+             economic_calendar(), earnings_calendar(days=10))
+    res = await asyncio.gather(
+        *(asyncio.wait_for(c, MORNING_BRIEF_DEP_TIMEOUT) for c in coros), return_exceptions=True)
+    degraded = [f"{n}: {'timed out after %.0fs' % MORNING_BRIEF_DEP_TIMEOUT if isinstance(r, TimeoutError) else type(r).__name__}"
+                for n, r in zip(names, res) if isinstance(r, BaseException)]
+    z, rg, vx, ec, ear = (_safe_dict(r) for r in res)
     today = _today_et()
     ev = []
     for e in (ec.get("events") or []):
@@ -5063,11 +5091,20 @@ async def morning_brief() -> dict:
                             "daysAway": r["daysAway"]} for r in earnings_soon],
     }
     try:
-        ls = await _recent_session_summary()
+        ls = await asyncio.wait_for(_recent_session_summary(), MORNING_BRIEF_DEP_TIMEOUT)
         if ls:
             out["lastSession"] = ls
+    except TimeoutError:
+        degraded.append(f"_recent_session_summary: timed out after {MORNING_BRIEF_DEP_TIMEOUT:.0f}s")
     except Exception:
         pass
+    if degraded:
+        # Empty is not zero: a section missing because its input timed out must never read as "no
+        # events" / "flat regime". Name what's missing so the reader discounts it.
+        out["degraded"] = degraded
+        out["degradedNote"] = ("Some inputs did not return in time. Their sections are EMPTY, not "
+                               "zero -- do not read a missing calendar as 'no events' or a missing "
+                               "regime as neutral.")
     out["disciplineReset"] = "Fresh day - target and give-back limits reset. Run should_i_trade first."
     return out
 
