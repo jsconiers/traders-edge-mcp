@@ -15,6 +15,10 @@ if [ -f test_b20_eod_date.py ] && [ -n "$TE_LIVE" ]; then
   echo "== B20 eod_wrap date =="; PYTHONPATH="$(pwd)" "$PY" test_b20_eod_date.py
 fi
 
+if [ -f test_b25_macro_regime.py ]; then
+  echo "== B25 macroRegime rename =="; PYTHONPATH="$(pwd)" "$PY" test_b25_macro_regime.py
+fi
+
 if [ -f test_b24_morning_brief.py ]; then
   echo "== B24 morning_brief bounded =="; PYTHONPATH="$(pwd)" "$PY" test_b24_morning_brief.py
 fi

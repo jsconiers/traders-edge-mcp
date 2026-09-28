@@ -4283,12 +4283,21 @@ async def regime_classifier() -> dict:
         regime = "CAUTION"
     else:
         regime = "RISK-OFF / STRESS"
+    # B25: these describe the MACRO backdrop only. This function scores VIX, financial conditions,
+    # credit spreads, the curve and the Sahm rule -- it never reads dealer gamma. The old strings
+    # nonetheless claimed "long-gamma backdrop", "gamma flips" and "negative gamma", and issued
+    # fade-vs-follow instructions that depend entirely on the gamma regime. On 8 sessions between
+    # 2026-09-01 and 09-28 this said "fading extremes work" while zero_dte_exposure showed SHORT gamma
+    # with spot below the flip -- the exact inversion that costs money on a trend day. Intraday
+    # tactics belong to gexRegime; this now says only what it actually measured.
     posture = {
-        "RISK-ON": "Calm/long-gamma backdrop: pinning & mean-reversion favored; fading extremes and premium-selling work; normal size.",
-        "CONSTRUCTIVE": "Mostly calm: lean range/mean-revert but keep stops; normal-to-slightly-reduced size.",
-        "NEUTRAL": "Mixed signals: trade levels both ways, no strong edge; standard risk.",
-        "CAUTION": "Stress building (vol/credit): expect trend and gamma flips; cut size, respect levels, avoid fading strength/weakness.",
-        "RISK-OFF / STRESS": "Acute stress: large ranges, negative gamma; trade small or stand aside, no counter-trend fades.",
+        "RISK-ON": "Macro calm: low vol, loose financial conditions, benign credit. Supportive backdrop; "
+                   "normal size. Says nothing about intraday dealer gamma -- use gexRegime for fade vs follow.",
+        "CONSTRUCTIVE": "Macro mostly calm with minor stress signals. Supportive but not uniform; "
+                        "normal-to-slightly-reduced size.",
+        "NEUTRAL": "Macro mixed: no clear backdrop signal either way; standard risk.",
+        "CAUTION": "Macro stress building in vol and/or credit. Larger ranges more likely; cut size.",
+        "RISK-OFF / STRESS": "Acute macro stress in vol and credit. Large ranges likely; trade small or stand aside.",
     }[regime]
     return {"asof": "CBOE ~15-min + FRED daily", "regime": regime, "compositeScore": score,
             "factorsScored": n, "avgFactor": round(score / n, 2) if n else 0.0,
@@ -5076,8 +5085,13 @@ async def morning_brief() -> dict:
     cw, pw = (z.get("callWall") or {}), (z.get("putWall") or {})
     out = {
         "date": today.isoformat(),
-        "regime": {"label": rg.get("regime"), "score": rg.get("compositeScore"),
-                   "posture": rg.get("posture")},
+        # B25: renamed from "regime". It is a macro read (VIX, FCI, credit, curve, Sahm) and was
+        # being read as the trading regime. The dealer-gamma regime -- which decides fade vs follow --
+        # is levels.gexRegime.
+        "macroRegime": {"label": rg.get("regime"), "score": rg.get("compositeScore"),
+                        "posture": rg.get("posture"),
+                        "scope": "Macro backdrop only (VIX, financial conditions, credit, curve, Sahm). "
+                                 "NOT a dealer-gamma read -- intraday fade/follow comes from levels.gexRegime."},
         "levels": {"spot": z.get("spot"), "asof": z.get("asof"),
                    "source": z.get("source"), "freshness": z.get("freshness"),   # (#1)
                    "expectedMovePts": em.get("expectedMovePts"), "expectedMovePct": em.get("expectedMovePct"),
@@ -5090,6 +5104,17 @@ async def morning_brief() -> dict:
         "earningsNext7d": [{"symbol": r["symbol"], "date": r["date"], "session": r.get("session"),
                             "daysAway": r["daysAway"]} for r in earnings_soon],
     }
+    # B25: when the macro backdrop and dealer gamma point opposite ways, say so explicitly and say
+    # which one governs entries. Silence here is what let a calm macro read override a short-gamma tape.
+    _g, _m = (z.get("regime") or "").lower(), (rg.get("regime") or "")
+    if "short gamma" in _g and _m in ("RISK-ON", "CONSTRUCTIVE"):
+        out["regimeConflict"] = (f"Macro backdrop reads {_m}, but dealer gamma is SHORT ({z.get('regime')}). "
+                                 "For intraday entries follow gexRegime: moves amplify -- follow breaks, "
+                                 "do not fade extremes.")
+    elif "long gamma" in _g and _m in ("CAUTION", "RISK-OFF / STRESS"):
+        out["regimeConflict"] = (f"Macro backdrop reads {_m}, but dealer gamma is LONG ({z.get('regime')}). "
+                                 "For intraday entries follow gexRegime: expect pinning and mean-reversion "
+                                 "toward walls, even under macro stress.")
     try:
         ls = await asyncio.wait_for(_recent_session_summary(), MORNING_BRIEF_DEP_TIMEOUT)
         if ls:
@@ -5178,7 +5203,7 @@ async def eod_wrap(date: Optional[str] = None) -> dict:
         _done = (d_obj < _today_et()) or (_dt.datetime.now(ET).time() >= _session_close_et(d_obj))
         out["closingLevels"] = {"spot": s.get("spot"), "gammaFlip": s.get("gamma_flip"),
                                 "callWall": s.get("call_wall"), "putWall": s.get("put_wall"),
-                                "vix": s.get("vix"), "regime": s.get("regime"),
+                                "vix": s.get("vix"), "macroRegime": s.get("regime"),   # B25: macro, not gamma
                                 "source": "closing snapshot" if _done else "INTRADAY snapshot",
                                 "freshness": {"asof": out["date"],
                                               "note": "session close" if _done else
