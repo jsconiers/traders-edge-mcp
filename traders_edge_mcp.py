@@ -508,8 +508,8 @@ def _spy_quote_sync() -> tuple:
     historicals both 404 under robin_stocks, while equity quotes return normally).
     """
     import robin_stocks.robinhood as rh
-    _rh_login_sync()
     try:
+        _rh_login_sync()   # B26: login can now raise SESSION_EXPIRED fast -- tier 2 must degrade, not break the gate
         q = (rh.stocks.get_quotes("SPY") or [None])[0] or {}
     except Exception:  # noqa: BLE001
         return None, None
@@ -2207,9 +2207,11 @@ def _occ_symbol(root: str, expiry: str, cp: str, strike) -> str:
 
 
 RH_REAUTH_HINT = (
-    "Robinhood session expired or unauthorized. Re-auth in Terminal: "
-    "rm -f ~/.robinhood/robinhood.pickle && python3 -c "
-    "\"import robin_stocks.robinhood as r; r.login()\"  then restart Claude Desktop.")
+    "Robinhood session expired or needs verification. Re-auth in a Terminal (NOT inside Claude): "
+    "cd ~/Claude/MCP/traders-edge-mcp && .venv/bin/python rh_reauth.py  -- approve the device "
+    "prompt in the Robinhood app if asked. Do NOT delete the old pickle first: it carries the "
+    "trusted device token, and a new device guarantees a verification challenge. No restart needed; "
+    "the server picks up the new session on its next call.")
 
 
 def _rh_auth_failed(exc: BaseException) -> bool:
@@ -2224,7 +2226,57 @@ def _rh_auth_failed(exc: BaseException) -> bool:
     s = str(exc).lower()
     return ("401" in s or "unauthorized" in s
             or "nonetype' object has no attribute" in s
+            or "session_expired" in s or "verification required" in s    # B26
             or "login" in s and "expired" in s)
+
+
+class _RHChallengeRequired(Exception):
+    """B26: raised in place of robin_stocks' interactive verification handler."""
+
+
+# B26: set to the pickle's mtime when a verification challenge blocked login. While the pickle is
+# unchanged we refuse to send credentials again: every credential login can fire another
+# device-approval push to the user's phone, and a background server that sprays approval prompts
+# trains exactly the reflex MFA-fatigue phishing relies on. Cleared when the pickle changes, i.e.
+# when the user has re-authed out of band with rh_reauth.py.
+_rh_block = {"pickle_mtime": None}
+
+
+def _rh_pickle_file() -> str:
+    d = os.environ.get("RH_PICKLE_PATH", RH_PICKLE_DIR_DEFAULT)
+    return os.path.join(d, "robinhood" + os.environ.get("RH_PICKLE_NAME", "") + ".pickle")
+
+
+def _rh_pickle_mtime():
+    try:
+        return os.path.getmtime(_rh_pickle_file())
+    except OSError:
+        return None
+
+
+def _rh_harden() -> None:
+    """B26: make robin_stocks safe to run inside an MCP stdio server. Idempotent.
+
+    (1) robin_stocks prints to sys.stdout by default. In a stdio MCP server, stdout IS the JSON-RPC
+        channel, so every "Starting login process..." line was being injected into the protocol
+        stream Claude Desktop parses. Route it to stderr.
+    (2) Its verification handler (_validate_sherrif_id) either polls in a sleep loop waiting for a
+        device approval, or calls input() for an SMS/email code. The first froze every tool for ~3h
+        on 2026-09-29. The second is worse: stdin is ALSO the MCP channel, so input() would consume
+        a protocol message from Claude Desktop and submit it to Robinhood as the verification code.
+        Interactive verification belongs in a Terminal (rh_reauth.py), never in the server -- so
+        inside this process it raises instead.
+    """
+    import robin_stocks.robinhood.authentication as _rha
+    import robin_stocks.robinhood.helper as _rhh
+    _rhh.set_output(sys.stderr)
+    if getattr(_rha._validate_sherrif_id, "_te_hardened", False):
+        return
+
+    def _no_interactive_challenge(*_a, **_k):
+        raise _RHChallengeRequired()
+    _no_interactive_challenge._te_hardened = True
+    _rha._validate_sherrif_id = _no_interactive_challenge
 
 
 def _rh_login_sync() -> None:
@@ -2236,15 +2288,29 @@ def _rh_login_sync() -> None:
         from dotenv import load_dotenv
     except ImportError:
         raise EdgeError("robin_stocks not installed in this environment.")
+    _rh_harden()
+    # B26: a previous attempt hit a verification challenge. Refuse to send credentials again until
+    # the pickle changes (the user re-authed out of band) -- fail in milliseconds, not minutes.
+    if _rh_block["pickle_mtime"] is not None:
+        if _rh_pickle_mtime() == _rh_block["pickle_mtime"]:
+            raise EdgeError("Robinhood SESSION_EXPIRED (verification required). " + RH_REAUTH_HINT)
+        _rh_block["pickle_mtime"] = None
+        log.info("B26: Robinhood pickle changed since the challenge; retrying login with it.")
     envf = os.environ.get("RH_ENV_FILE", RH_ENV_DEFAULT)
     if os.path.exists(envf):
         load_dotenv(envf)
     u, p = os.environ.get("RH_USERNAME"), os.environ.get("RH_PASSWORD")
     if not (u and p):
         raise EdgeError("Robinhood credentials not found (set RH_USERNAME/RH_PASSWORD or RH_ENV_FILE).")
-    rh.login(u, p, store_session=True,
-             pickle_path=os.environ.get("RH_PICKLE_PATH", RH_PICKLE_DIR_DEFAULT),
-             pickle_name=os.environ.get("RH_PICKLE_NAME", ""), expiresIn=86400 * 7)
+    try:
+        rh.login(u, p, store_session=True,
+                 pickle_path=os.environ.get("RH_PICKLE_PATH", RH_PICKLE_DIR_DEFAULT),
+                 pickle_name=os.environ.get("RH_PICKLE_NAME", ""), expiresIn=86400 * 7)
+    except _RHChallengeRequired:
+        _rh_block["pickle_mtime"] = _rh_pickle_mtime()
+        log.warning("B26: Robinhood demanded verification; refusing an interactive challenge inside "
+                    "the server. %s", RH_REAUTH_HINT)
+        raise EdgeError("Robinhood SESSION_EXPIRED (verification required). " + RH_REAUTH_HINT)
     _rh_logged_in = True
 
 
@@ -3219,9 +3285,7 @@ def _rh_recent_option_orders(stop_date: _dt.date, max_pages: int = 12, page_size
         # unreadable ledger must raise, so callers report UNKNOWN rather than a confident zero.
         raise EdgeError(
             "Cannot read Robinhood order history - the session is expired or unreachable, so "
-            "P&L is UNKNOWN (this is NOT a no-trade day). Re-auth in Terminal: "
-            "rm -f ~/.robinhood/robinhood.pickle && cd <your robinhood-mcp dir> && "
-            "python3 -c 'import robinhood_mcp_v2 as m; m._login()'  then restart Claude Desktop.")
+            "P&L is UNKNOWN (this is NOT a no-trade day). " + RH_REAUTH_HINT)
     while data and isinstance(data, dict):
         results = data.get("results", []) or []
         out.extend(results)
@@ -5740,8 +5804,8 @@ async def account_growth(span: str = "year") -> dict:
 
 def _spy_live_sync():
     import robin_stocks.robinhood as rh
-    _rh_login_sync()
     try:
+        _rh_login_sync()   # B26: degrade to None on SESSION_EXPIRED rather than raise into feed_health
         p = rh.stocks.get_latest_price("SPY", includeExtendedHours=True)
         return _to_float(p[0]) if p and p[0] else None
     except Exception:
